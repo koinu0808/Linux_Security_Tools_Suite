@@ -1,6 +1,7 @@
 import sys, os, shlex, subprocess, shutil, time
 from PyQt5 import QtCore, QtGui, QtWidgets
 import subprocess, sys
+from PyQt5.QtCore import QThread, pyqtSignal
 
 if sys.platform.startswith("win"):  # silent
     _orig_popen = subprocess.Popen
@@ -342,36 +343,102 @@ class NcPage(ToolPageBase):
         if mode == "connect": self.start_worker([exe, h, p])
         else: self.start_worker([exe, "-l", "-p", p])
 
-class NmapPage(ToolPageBase):
-    def __init__(self,parent=None):
+class NmapWorker(QThread):
+    # 定義信號，用於在任務完成後更新 GUI
+    finished_signal = pyqtSignal(str, str)  # 結果: stdout, stderr
+
+    def __init__(self, cmd, parent=None):
         super().__init__(parent)
+        self.cmd = cmd
+
+    def run(self):
+        # 執行命令
+        try:
+            process = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate()
+            # 發送結果到主線程
+            self.finished_signal.emit(stdout.decode(), stderr.decode())
+        except Exception as e:
+            self.finished_signal.emit("", f"[ERROR] 執行命令時出現錯誤: {e}")
+
+
+class NmapPage(ToolPageBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
         self.desc.setText("nmap：掃描主機/埠。WSL + sudo 支援（會使用 echo PW | sudo -S 執行，注意風險）。")
+        
         f = QtWidgets.QFormLayout()
-        self.scan = QtWidgets.QComboBox(); self.scan.addItems(["-sT","-sS","-sU","-sn"])
-        self.ports = QtWidgets.QLineEdit(); self.ports.setPlaceholderText("1-1024 or 22,80,443")
-        self.extra = QtWidgets.QLineEdit(); self.extra.setPlaceholderText("-A -Pn -T4")
+        
+        # 設置掃描選項
+        self.scan = QtWidgets.QComboBox()
+        self.scan.addItems(["-sT", "-sS", "-sU", "-sn"])
+        
+        # 設置端口範圍
+        self.ports = QtWidgets.QLineEdit()
+        self.ports.setPlaceholderText("1-1024 or 22,80,443")
+        
+        # 額外參數
+        self.extra = QtWidgets.QLineEdit()
+        self.extra.setPlaceholderText("-A -Pn -T4")
+        
+        # WSL sudo 勾選框和密碼輸入框
         self.sudo_ck = QtWidgets.QCheckBox("Use sudo (when using WSL)")
-        self.sudo_pass = QtWidgets.QLineEdit(); self.sudo_pass.setEchoMode(QtWidgets.QLineEdit.Password)
-        f.addRow("Scan:", self.scan); f.addRow("Ports:", self.ports); f.addRow("Extra:", self.extra)
-        f.addRow("", self.sudo_ck); f.addRow("WSL sudo 密碼:", self.sudo_pass)
+        self.sudo_pass = QtWidgets.QLineEdit()
+        self.sudo_pass.setEchoMode(QtWidgets.QLineEdit.Password)
+        
+        # 將元素加到佈局中
+        f.addRow("Scan:", self.scan)
+        f.addRow("Ports:", self.ports)
+        f.addRow("Extra:", self.extra)
+        f.addRow("", self.sudo_ck)
+        f.addRow("WSL sudo 密碼:", self.sudo_pass)
+        
         self.options_layout.addLayout(f)
+
     def on_start_clicked(self):
         target = self.target_edit.text().strip()
-        if not target: self.output.appendPlainText("[ERROR] 請輸入 target"); return
+        if not target:
+            self.output.appendPlainText("[ERROR] 請輸入 target")
+            return
+        
         cmd_parts = ["nmap", self.scan.currentText()]
-        if self.ports.text().strip(): cmd_parts += ["-p", self.ports.text().strip()]
-        if self.extra.text().strip(): cmd_parts += shlex.split(self.extra.text().strip())
-        cmd_parts += ["-oN","-"] + shlex.split(target)
+        
+        if self.ports.text().strip():
+            cmd_parts += ["-p", self.ports.text().strip()]
+        
+        if self.extra.text().strip():
+            cmd_parts += shlex.split(self.extra.text().strip())
+        
+        cmd_parts += ["-oN", "-"] + shlex.split(target)
+
         use_wsl = self.use_wsl_ck.isChecked()
+        
+        # 如果選擇使用 WSL 並且勾選了 sudo，則處理 sudo 密碼
         if use_wsl and self.sudo_ck.isChecked():
             pw = self.sudo_pass.text()
-            if not pw: self.output.appendPlainText("[ERROR] 勾選 Use sudo 但未填密碼"); return
+            if not pw:
+                self.output.appendPlainText("[ERROR] 勾選 Use sudo 但未填密碼")
+                return
+            
             safe_pw = shell_single_quote_escape(pw)
             nmap_cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
             bash_cmd = f"echo '{safe_pw}' | sudo -S {nmap_cmd_str}"
-            self.start_worker(["bash","-lc", bash_cmd]); return
-        self.start_worker(cmd_parts)
+            
+            # 打印命令以便調試
+            print(f"執行的 WSL 命令: {bash_cmd}")  # 檢查命令
 
+            # 使用 wsl 執行命令
+            self.start_worker([bash_cmd])
+            return
+        
+        # 如果沒有使用 WSL，直接執行命令
+        self.start_worker(cmd_parts)
+        
 class TraceroutePage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
@@ -494,14 +561,18 @@ class HydraPage(ToolPageBase):
         return path
 
     def _on_service_changed(self, svc):
-        self.http_group.setVisible(svc == "http-post-form")
+        if svc == "http-post-form" or svc == "http-get":
+            self.http_group.setVisible(True)
+        else:
+            self.http_group.setVisible(False)
 
     def on_start_clicked(self):
-        svc = self.service.currentText(); tgt = self.target_edit.text().strip()
+        svc = self.service.currentText()  # 取得選擇的服務
+        tgt = self.target_edit.text().strip()
         if not tgt: 
             self.output.appendPlainText("[ERROR] 請輸入 target")
             return
-        
+
         use_wsl = self.use_wsl_ck.isChecked()
         
         # 處理用戶輸入的 User（單一或文件）
@@ -510,7 +581,7 @@ class HydraPage(ToolPageBase):
             if not u: 
                 self.output.appendPlainText("[ERROR] User empty")
                 return
-            user_arg = ["-l", u]
+            user_arg = ["-l", u]  # 使用 -l 來指定單一用戶名
         else:
             ufile = self.user_file.text().strip()
             if not ufile: 
@@ -518,15 +589,16 @@ class HydraPage(ToolPageBase):
                 return
             if not os.path.exists(ufile): 
                 self.output.appendPlainText(f"[WARN] User file 在此系統找不到: {ufile}")
-            user_arg = ["-L", self._convert_path_for_execution(ufile, use_wsl)]
-        
+            # 確保 WSL 路徑轉換
+            user_arg = ["-L", self._convert_path_for_execution(ufile, use_wsl)]  
+
         # 處理密碼（單一或文件）
         if self.pass_single_rb.isChecked():
             p = self.pass_single.text().strip()
             if not p: 
                 self.output.appendPlainText("[ERROR] Password empty")
                 return
-            pass_arg = ["-p", p]
+            pass_arg = ["-p", p]  # 使用 -p 來指定單一密碼
         else:
             pfile = self.pass_file.text().strip()
             if not pfile: 
@@ -534,31 +606,53 @@ class HydraPage(ToolPageBase):
                 return
             if not os.path.exists(pfile): 
                 self.output.appendPlainText(f"[WARN] Pass file 在此系統上找不到: {pfile}")
-            pass_arg = ["-P", self._convert_path_for_execution(pfile, use_wsl)]
-        
+            # 確保 WSL 路徑轉換
+            pass_arg = ["-P", self._convert_path_for_execution(pfile, use_wsl)]  
+
         # 處理執行參數
         threads = self.threads.text().strip() or "4"
         
-        # 設定協議與URL格式
-        path = self.hp_path.text().strip().lstrip("/")
-        ufield = self.hp_userfield.text().strip() or "uid"
-        pfield = self.hp_passfield.text().strip() or "passw"
-        extra = self.hp_extrafield.text().strip(); fail = self.hp_failstr.text().strip() or "Login Failed"
-        
-        params = f"{ufield}=^USER^&{pfield}=^PASS^"
-        if extra:
-            params += extra if extra.startswith("&") else "&" + extra
-        
-        form = f"/{path}:{params}:{fail}"
-        proto = "https-post-form" if self.hp_https_ck.isChecked() else "http-post-form"
-        
-        cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} {proto} \"{form}\""]
+        # 根據選擇的服務生成不同的命令格式
+        if svc == "http-post-form" or svc == "http-get":
+            # 處理 http-get 或 http-post-form
+            path = self.hp_path.text().strip().lstrip("/")
+            ufield = self.hp_userfield.text().strip() or "uid"
+            pfield = self.hp_passfield.text().strip() or "passw"
+            extra = self.hp_extrafield.text().strip(); fail = self.hp_failstr.text().strip() or "Login Failed"
+            
+            params = f"{ufield}=^USER^&{pfield}=^PASS^"
+            if extra:
+                params += extra if extra.startswith("&") else "&" + extra
+            
+            form = f"/{path}:{params}:{fail}"
+            proto = "https-post-form" if svc == "http-post-form" else "http-get-form"  # 區分 http-get 和 http-post-form
+            
+            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} {proto} \"{form}\""]
 
-        if is_windows() and not command_exists("hydra") and not use_wsl:
-            self.output.appendPlainText("[WARN] hydra 未安裝在 Windows；請安裝或改勾 WSL")
+        elif svc == "ssh":
+            # 處理 ssh
+            if self.user_single_rb.isChecked() and self.pass_single_rb.isChecked():
+                # 單一用戶名/密碼
+                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"ssh://{tgt}"]
+            else:
+                # 批量用戶名/密碼，這裡應該轉換文件路徑
+                user_file_path = self._convert_path_for_execution(self.user_file.text().strip(), use_wsl)
+                pass_file_path = self._convert_path_for_execution(self.pass_file.text().strip(), use_wsl)
+                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"ssh://{tgt}"]
 
-        print("cmd 類型:", type(cmd))
+        elif svc == "ftp":
+            # 處理 ftp
+            if self.user_single_rb.isChecked() and self.pass_single_rb.isChecked():
+                # 單一用戶名/密碼
+                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"ftp://{tgt}"]
+            else:
+                # 批量用戶名/密碼，這裡應該轉換文件路徑
+                user_file_path = self._convert_path_for_execution(self.user_file.text().strip(), use_wsl)
+                pass_file_path = self._convert_path_for_execution(self.pass_file.text().strip(), use_wsl)
+                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"ftp://{tgt}"]
 
+        # 輸出命令並開始執行
+        print(f"最終命令：{' '.join(cmd)}")
         self.start_worker(cmd)
 
 # ---------- main window ----------
