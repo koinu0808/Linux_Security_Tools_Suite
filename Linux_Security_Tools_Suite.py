@@ -74,17 +74,17 @@ def build_powershell_command_str(cmd_list):
     return " ".join([q(x) for x in cmd_list])
 
 def build_final_command(cmd_list, use_wsl=False):
-    # If user wants WSL on Windows -> prefix with wsl
+    # 如果選擇使用 WSL，則應該在命令前加上 'wsl' 前綴
     if use_wsl and is_windows():
-        return ["wsl"] + cmd_list
-    # On Windows without WSL, translate many common linux commands to PowerShell equivalents
-    if is_windows() and not use_wsl:
+        return ["wsl"] + cmd_list  # 添加 wsl 前綴，確保在 WSL 中執行
+    # 如果不使用 WSL 並且在 Windows 中，則使用 PowerShell 執行
+    elif is_windows() and not use_wsl:
         exe = cmd_list[0].lower()
-        external = {"nmap","ncat","nc","hydra","john","hashid","tcpdump"}
+        external = {"nmap", "ncat", "nc", "hydra", "john", "hashid", "tcpdump"}
         if exe in external and command_exists(exe):
             return cmd_list
         ps = build_powershell_command_str(cmd_list)
-        return ["powershell","-NoProfile","-Command", ps]
+        return ["powershell", "-NoProfile", "-Command", ps]
     return cmd_list
 
 # ---------- worker ----------
@@ -92,6 +92,7 @@ class CmdWorker(QtCore.QObject):
     output_line = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
     started = QtCore.pyqtSignal()
+
     def __init__(self, cmd_list, encoding="utf-8", use_wsl=False):
         super().__init__()
         self.cmd_list = cmd_list
@@ -104,17 +105,33 @@ class CmdWorker(QtCore.QObject):
     def run(self):
         self.started.emit()
         try:
+            # 保持原來的 build_final_command 函式不變，並確保它返回的是正確的命令
             full_cmd = build_final_command(self.cmd_list, use_wsl=self.use_wsl)
+            print("最終命令：", full_cmd)  # 用來檢查傳遞給 subprocess 的命令
+
+            # 如果 full_cmd 是列表格式，我們需要將它轉換為命令字符串
+            if isinstance(full_cmd, list):
+                full_cmd = ' '.join(full_cmd)
+
+            # 使用 subprocess 執行命令
             self._proc = subprocess.Popen(full_cmd, stdout=subprocess.PIPE,
-                                          stderr=subprocess.STDOUT, text=True,
-                                          encoding=self.encoding, errors="replace", bufsize=1)
+                                           stderr=subprocess.STDOUT, text=True,
+                                           encoding=self.encoding, errors="replace", bufsize=1)
+            
             for line in self._proc.stdout:
-                if self._stop: break
+                if self._stop:
+                    break
                 self.output_line.emit(line.rstrip("\n"))
+            
             if self._stop and self._proc and self._proc.poll() is None:
-                try: self._proc.terminate()
-                except: pass
-            if self._proc: self._proc.wait()
+                try:
+                    self._proc.terminate()
+                except:
+                    pass
+            
+            if self._proc:
+                self._proc.wait()
+        
         except FileNotFoundError as e:
             self.output_line.emit(f"[ERROR] command not found: {e}")
         except Exception as e:
@@ -127,7 +144,8 @@ class CmdWorker(QtCore.QObject):
         try:
             if self._proc and self._proc.poll() is None:
                 self._proc.terminate()
-        except: pass
+        except:
+            pass
 
 # ---------- base page ----------
 class ToolPageBase(QtWidgets.QWidget):
@@ -534,12 +552,13 @@ class HydraPage(ToolPageBase):
         form = f"/{path}:{params}:{fail}"
         proto = "https-post-form" if self.hp_https_ck.isChecked() else "http-post-form"
         
-        # 修正指令格式，將 http(s)-post-form 放在 URL 之前
         cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} {proto} \"{form}\""]
-        
+
         if is_windows() and not command_exists("hydra") and not use_wsl:
             self.output.appendPlainText("[WARN] hydra 未安裝在 Windows；請安裝或改勾 WSL")
-        
+
+        print("cmd 類型:", type(cmd))
+
         self.start_worker(cmd)
 
 # ---------- main window ----------
