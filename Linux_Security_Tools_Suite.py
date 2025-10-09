@@ -472,7 +472,7 @@ class HydraPage(ToolPageBase):
             except Exception:
                 pass
             drive = path[0].lower(); tail = path[2:].replace("\\","/")
-            return f"/mnt/{drive}/{tail}"
+            return f"/mnt/{drive}{tail}"
         return path
 
     def _on_service_changed(self, svc):
@@ -480,47 +480,66 @@ class HydraPage(ToolPageBase):
 
     def on_start_clicked(self):
         svc = self.service.currentText(); tgt = self.target_edit.text().strip()
-        if not tgt: self.output.appendPlainText("[ERROR] 請輸入 target"); return
+        if not tgt: 
+            self.output.appendPlainText("[ERROR] 請輸入 target")
+            return
+        
         use_wsl = self.use_wsl_ck.isChecked()
+        
+        # 處理用戶輸入的 User（單一或文件）
         if self.user_single_rb.isChecked():
             u = self.user_single.text().strip()
-            if not u: self.output.appendPlainText("[ERROR] User empty"); return
+            if not u: 
+                self.output.appendPlainText("[ERROR] User empty")
+                return
             user_arg = ["-l", u]
         else:
             ufile = self.user_file.text().strip()
-            if not ufile: self.output.appendPlainText("[ERROR] User file 未填"); return
-            if not os.path.exists(ufile): self.output.appendPlainText(f"[WARN] User file 在此系統找不到: {ufile}")
+            if not ufile: 
+                self.output.appendPlainText("[ERROR] User file 未填")
+                return
+            if not os.path.exists(ufile): 
+                self.output.appendPlainText(f"[WARN] User file 在此系統找不到: {ufile}")
             user_arg = ["-L", self._convert_path_for_execution(ufile, use_wsl)]
+        
+        # 處理密碼（單一或文件）
         if self.pass_single_rb.isChecked():
             p = self.pass_single.text().strip()
-            if not p: self.output.appendPlainText("[ERROR] Password empty"); return
+            if not p: 
+                self.output.appendPlainText("[ERROR] Password empty")
+                return
             pass_arg = ["-p", p]
         else:
             pfile = self.pass_file.text().strip()
-            if not pfile: self.output.appendPlainText("[ERROR] Pass file 未填"); return
-            if not os.path.exists(pfile): self.output.appendPlainText(f"[WARN] Pass file 在此系統上找不到: {pfile}")
+            if not pfile: 
+                self.output.appendPlainText("[ERROR] Pass file 未填")
+                return
+            if not os.path.exists(pfile): 
+                self.output.appendPlainText(f"[WARN] Pass file 在此系統上找不到: {pfile}")
             pass_arg = ["-P", self._convert_path_for_execution(pfile, use_wsl)]
+        
+        # 處理執行參數
         threads = self.threads.text().strip() or "4"
-        if svc == "ssh":
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"ssh://{tgt}"]
-        elif svc == "http-get":
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"http-get://{tgt}"]
-        elif svc == "http-post-form":
-            path = self.hp_path.text().strip().lstrip("/")
-            ufield = self.hp_userfield.text().strip() or "uid"
-            pfield = self.hp_passfield.text().strip() or "passw"
-            extra = self.hp_extrafield.text().strip(); fail = self.hp_failstr.text().strip() or "Login Failed"
-            params = f"{ufield}=^USER^&{pfield}=^PASS^"
-            if extra:
-                params += extra if extra.startswith("&") else "&"+extra
-            form = f"/{path}:{params}:{fail}"
-            proto = "https-post-form" if self.hp_https_ck.isChecked() else "http-post-form"
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{proto}://{tgt}{form}"]
-        else:
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{svc}://{tgt}"]
-
+        
+        # 設定協議與URL格式
+        path = self.hp_path.text().strip().lstrip("/")
+        ufield = self.hp_userfield.text().strip() or "uid"
+        pfield = self.hp_passfield.text().strip() or "passw"
+        extra = self.hp_extrafield.text().strip(); fail = self.hp_failstr.text().strip() or "Login Failed"
+        
+        params = f"{ufield}=^USER^&{pfield}=^PASS^"
+        if extra:
+            params += extra if extra.startswith("&") else "&" + extra
+        
+        form = f"/{path}:{params}:{fail}"
+        proto = "https-post-form" if self.hp_https_ck.isChecked() else "http-post-form"
+        
+        # 修正指令格式，將 http(s)-post-form 放在 URL 之前
+        cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} {proto} \"{form}\""]
+        
         if is_windows() and not command_exists("hydra") and not use_wsl:
             self.output.appendPlainText("[WARN] hydra 未安裝在 Windows；請安裝或改勾 WSL")
+        
         self.start_worker(cmd)
 
 # ---------- main window ----------
