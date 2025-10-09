@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['Linux_ Security_Tools_Suite_美化版.py'],
+    ['Linux_Security_Tools_Suite.py'],
     pathex=[],
     binaries=[],
     datas=[('C:\\Users\\zjapa\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python312\\site-packages\\PyQt5\\Qt5\\plugins', 'PyQt5\\Qt5\\plugins')],
