@@ -1,6 +1,10 @@
-user
-admin
+password
 123456
+Test123!
+qazwsx
+letmein
+admin
 yhchen
-aaa
-0000
+P@ssw0rd!
+welcome1
+changeme
