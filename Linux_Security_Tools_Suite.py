@@ -58,7 +58,19 @@ def build_powershell_command_str(cmd_list):
         path = args[-1] if args else "."
         return f"Get-Content -Raw -LiteralPath \"{q(path)}\""
     if exe == "whoami":
-        return "whoami"
+        ps = (
+        "$u = whoami; "
+        "$os = (Get-CimInstance Win32_OperatingSystem); "
+        "$cpu = (Get-CimInstance Win32_Processor).Name; "
+        "$mem = [math]::Round($os.TotalVisibleMemorySize/1MB,2); "
+        "$ver = [System.Environment]::OSVersion.VersionString; "
+        "Write-Output ('使用者: ' + $u); "
+        "Write-Output ('作業系統: ' + $os.Caption); "
+        "Write-Output ('版本: ' + $ver); "
+        "Write-Output ('CPU: ' + $cpu); "
+        "Write-Output ('RAM: ' + $mem + ' GB');"
+        )
+        return ps
     if exe == "ping":
         cnt="4"; host = args[-1] if args else "8.8.8.8"
         for i,a in enumerate(args):
@@ -77,7 +89,20 @@ def build_powershell_command_str(cmd_list):
 def build_final_command(cmd_list, use_wsl=False):
     # 如果選擇使用 WSL，則應該在命令前加上 'wsl' 前綴
     if use_wsl and is_windows():
-        return ["wsl"] + cmd_list  # 添加 wsl 前綴，確保在 WSL 中執行
+        if cmd_list[0] == "whoami":
+            linux_cmd = (
+                "u=$(id -un 2>/dev/null | tr -d '\\r' | xargs); "
+                "if [ -z \"$u\" ]; then u=$(whoami | tr -d '\\r' | xargs); fi; "
+                "sys=$(uname -o | tr -d '\\r' | xargs); "
+                "ver=$(uname -r | tr -d '\\r' | xargs); "
+                "ker=$(uname -s | tr -d '\\r' | xargs); "
+                "cpu=$(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs); "
+                "ram=$(free -h | awk '/Mem:/ {print $2}' | tr -d '\\r' | xargs); "
+                "printf '使用者: %s\\n系統: %s\\n版本: %s\\n核心: %s\\nCPU: %s\\nRAM: %s\\n' "
+                "\"$u\" \"$sys\" \"$ver\" \"$ker\" \"$cpu\" \"$ram\"; "
+                "exit 0"
+            )
+            return ['wsl', 'bash', '-c', linux_cmd]
     # 如果不使用 WSL 並且在 Windows 中，則使用 PowerShell 執行
     elif is_windows() and not use_wsl:
         exe = cmd_list[0].lower()
@@ -202,6 +227,10 @@ class ToolPageBase(QtWidgets.QWidget):
         actions = QtWidgets.QHBoxLayout()
         self.start_btn = QtWidgets.QPushButton("Start")
         self.stop_btn = QtWidgets.QPushButton("Stop"); self.stop_btn.setEnabled(False)
+        # 當 WSL 勾選框變化時，自動通知主視窗切換編碼
+        self.use_wsl_ck.toggled.connect(
+            lambda v: self.main_window().set_encoding_based_on_wsl(v)
+        )
         actions.addWidget(self.start_btn); actions.addWidget(self.stop_btn); actions.addStretch()
         v.addLayout(actions)
 
@@ -228,9 +257,10 @@ class ToolPageBase(QtWidgets.QWidget):
             self.output.appendPlainText("[ERROR] 找不到主視窗")
             return
         use_wsl = self.use_wsl_ck.isChecked()
+        mw.set_encoding_based_on_wsl(use_wsl)
         encoding = mw.encoding_combo.currentText()
         self.output.clear()
-        self.output.appendPlainText(f"執行: {' '.join(cmd_list)}\n")
+        self.output.appendPlainText(f"[START]\n")
         if is_windows() and not use_wsl:
             exe = cmd_list[0].lower()
             if exe in {"nmap","hydra","john","tcpdump","hashid","ncat","nc"} and not command_exists(exe):
@@ -262,7 +292,7 @@ class ToolPageBase(QtWidgets.QWidget):
 class WhoamiPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("顯示目前使用者 (whoami)。此頁僅顯示是否使用 WSL 選項。")
+        self.desc.setText("顯示目前電腦系統資訊")
         self.target_label.hide(); self.target_edit.hide()
         # hide options area entirely
         self.options_scroll.hide()
@@ -273,20 +303,20 @@ class WhoamiPage(ToolPageBase):
 class LsPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("ls：列出目錄內容。Options 可填 -l/-la，Target 為路徑或留空。")
+        self.desc.setText("列出目錄內容。Options 可填 -l/-la，Target 為路徑或留空。")
         form = QtWidgets.QFormLayout()
         self.opt = QtWidgets.QLineEdit(); self.opt.setPlaceholderText("-l -la")
         form.addRow("Options:", self.opt)
         self.options_layout.addLayout(form)
     def on_start_clicked(self):
         opts = self.opt.text().strip(); path = self.target_edit.text().strip() or "."
-        parts = ["ls"] + (shlex.split(opts) if opts else []) + [path]
+        parts = ["wsl","ls"] + (shlex.split(opts) if opts else []) + [path]
         self.start_worker(parts)
 
 class CatPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("cat：讀檔並用左下編碼或自動嘗試多種編碼解碼（避免亂碼）。")
+        self.desc.setText("讀取並顯示檔案內容")
         row = QtWidgets.QHBoxLayout()
         self.auto_ck = QtWidgets.QCheckBox("Auto try encodings (utf-8 → cp950 → gbk)")
         row.addWidget(self.auto_ck); row.addStretch()
@@ -316,19 +346,19 @@ class CatPage(ToolPageBase):
 class PingPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("ping：測試連線 (Count 可設定)。")
+        self.desc.setText("測試連線品質、延遲 (Count 可設定)。")
         f = QtWidgets.QFormLayout()
         self.cnt = QtWidgets.QLineEdit("4")
         f.addRow("Count:", self.cnt)
         self.options_layout.addLayout(f)
     def on_start_clicked(self):
         t = self.target_edit.text().strip() or "8.8.8.8"; cnt = self.cnt.text().strip() or "4"
-        self.start_worker(["ping","-c",cnt,t])
+        self.start_worker(["wsl","ping","-c",cnt,t])
 
 class NcPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("nc：connect 或 listen。若勾選 WSL，執行 WSL 的 nc。")
+        self.desc.setText("連線傳輸測試。若勾選 WSL，執行 WSL 的 nc。")
         self.target_label.hide(); self.target_edit.hide()
         f = QtWidgets.QFormLayout()
         self.mode = QtWidgets.QComboBox(); self.mode.addItems(["connect","listen"])
@@ -339,7 +369,7 @@ class NcPage(ToolPageBase):
         mode = self.mode.currentText(); h = self.host.text().strip() or "127.0.0.1"; p = self.port.text().strip()
         if not p: self.output.appendPlainText("[ERROR] 請輸入 port"); return
         use_wsl = self.use_wsl_ck.isChecked()
-        exe = "nc" if use_wsl else ("nc" if command_exists("nc") else ("ncat" if command_exists("ncat") else "nc"))
+        exe = "wsl nc" if use_wsl else ("nc" if command_exists("nc") else ("ncat" if command_exists("ncat") else "nc"))
         if mode == "connect": self.start_worker([exe, h, p])
         else: self.start_worker([exe, "-l", "-p", p])
 
@@ -370,13 +400,13 @@ class NmapPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
         
-        self.desc.setText("nmap：掃描主機/埠。WSL + sudo 支援（會使用 echo PW | sudo -S 執行，注意風險）。")
+        self.desc.setText("掃描主機/埠。WSL + sudo 支援（會使用 echo PW | sudo -S 執行，注意風險）。")
         
         f = QtWidgets.QFormLayout()
         
         # 設置掃描選項
         self.scan = QtWidgets.QComboBox()
-        self.scan.addItems(["-sT", "-sS", "-sU", "-sn"])
+        self.scan.addItems(["-sT (TCP 連線掃描)", "-sS (SYN 掃描)", "-sU (UDP 掃描)", "-sn (Ping 掃描)"])
         
         # 設置端口範圍
         self.ports = QtWidgets.QLineEdit()
@@ -405,44 +435,62 @@ class NmapPage(ToolPageBase):
         if not target:
             self.output.appendPlainText("[ERROR] 請輸入 target")
             return
-        
-        cmd_parts = ["nmap", self.scan.currentText()]
-        
+
+        # 取得 scan flag（前 3 個字元應該足夠 -sT/-sS/-sU/-sn）
+        scan_flag = self.scan.currentText()[0:3]
+
+        # 組 ports & extra
+        parts = []
         if self.ports.text().strip():
-            cmd_parts += ["-p", self.ports.text().strip()]
-        
+            parts += ["-p", self.ports.text().strip()]
         if self.extra.text().strip():
-            cmd_parts += shlex.split(self.extra.text().strip())
-        
-        cmd_parts += ["-oN", "-"] + shlex.split(target)
+            parts += shlex.split(self.extra.text().strip())
 
         use_wsl = self.use_wsl_ck.isChecked()
-        
-        # 如果選擇使用 WSL 並且勾選了 sudo，則處理 sudo 密碼
-        if use_wsl and self.sudo_ck.isChecked():
+        use_sudo = self.sudo_ck.isChecked()
+        # 基本 nmap 命令陣列（不含 sudo）
+        if not use_wsl:
+            cmd_parts = ["nmap", scan_flag] + parts + ["-oN", "-", target]
+        else:
+            if use_sudo:
+                cmd_parts = ["nmap", scan_flag] + parts + ["-oN", "-", target]
+            else:
+                cmd_parts = ["wsl","nmap", scan_flag] + parts + ["-oN", "-", target]        
+
+        # 如果選擇使用 WSL 並且勾選了 sudo，則處理 sudo 密碼並用 wsl echo 'pw' | sudo -S ...
+        if use_wsl and use_sudo:
             pw = self.sudo_pass.text()
             if not pw:
                 self.output.appendPlainText("[ERROR] 勾選 Use sudo 但未填密碼")
                 return
-            
-            safe_pw = shell_single_quote_escape(pw)
-            nmap_cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
-            bash_cmd = f"echo '{safe_pw}' | sudo -S {nmap_cmd_str}"
-            
-            # 打印命令以便調試
-            print(f"執行的 WSL 命令: {bash_cmd}")  # 檢查命令
 
-            # 使用 wsl 執行命令
-            self.start_worker([bash_cmd])
+            # 安全跳脫單引號，避免破壞 shell 字串
+            safe_pw = shell_single_quote_escape(pw)
+
+            # 把 cmd_parts 轉成被 shell 正確解析的單行字串（用 shlex.quote）
+            # 注意：在 Windows 上我們會 prefix 'wsl '，讓整個管線在 WSL bash 內執行
+            nmap_cmd_str = " ".join(shlex.quote(p) for p in cmd_parts)
+
+            # 最終我們要的指令格式（如你要求）
+            bash_cmd = f"echo '{safe_pw}' | sudo -S {nmap_cmd_str}"
+
+            # 加上 wsl 前綴，呈現你期望的輸出： wsl echo 'pw' | sudo -S nmap ...
+            final_cmd = f"wsl {bash_cmd}"
+
+            # debug（可留可刪）
+            print(f"執行的 WSL 命令: {final_cmd}")
+
+            # 使用 start_worker 傳入 single-string list（與你現有程式相容）
+            self.start_worker([final_cmd])
             return
-        
-        # 如果沒有使用 WSL，直接執行命令
+
+        # 否則（沒勾 WSL 或沒勾 sudo）直接執行本地 nmap 命令（list）
         self.start_worker(cmd_parts)
         
 class TraceroutePage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("traceroute：追蹤路由。請在 Options 欄直接輸入完整 traceroute 參數（例如 -4 -d -w 300 -m 30）。")
+        self.desc.setText("路由追蹤。請在 Options 欄直接輸入完整 traceroute 參數（例如 -4 -d -w 300 -m 30）。")
         form = QtWidgets.QFormLayout()
         self.opts_input = QtWidgets.QLineEdit()
         self.opts_input.setPlaceholderText("輸入 traceroute 參數，例如: -4 -d -w 300 -m 30")
@@ -462,18 +510,18 @@ class TraceroutePage(ToolPageBase):
 class DigPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("dig：DNS 查詢，可加 +short 顯示簡短答案。")
+        self.desc.setText("DNS 查詢，可加 +short 顯示簡短答案。")
         h = QtWidgets.QHBoxLayout(); self.short_ck = QtWidgets.QCheckBox("+short"); h.addWidget(self.short_ck); h.addStretch()
         self.options_layout.addLayout(h)
     def on_start_clicked(self):
         t = self.target_edit.text().strip() or "example.com"
-        if self.short_ck.isChecked(): self.start_worker(["dig","+short",t])
-        else: self.start_worker(["dig",t])
+        if self.short_ck.isChecked(): self.start_worker(["wsl","dig","+short",t])
+        else: self.start_worker(["wsl","dig",t])
 
 class CurlPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("curl：HTTP(S) 客戶端，檢查 header/status，或模擬表單。")
+        self.desc.setText("請求HTTP(S)，檢查 header/status，或列出HTML。")
         f = QtWidgets.QFormLayout()
         self.method = QtWidgets.QComboBox(); self.method.addItems(["GET","HEAD","POST"])
         f.addRow("Method:", self.method)
@@ -490,7 +538,7 @@ class CurlPage(ToolPageBase):
 class HydraPage(ToolPageBase):
     def __init__(self,parent=None):
         super().__init__(parent)
-        self.desc.setText("hydra：暴力破解（請在授權範圍內使用）。User/Pass 可選 Single 或 File（editable）。")
+        self.desc.setText("暴力破解（請在授權範圍內使用）。User/Pass 可選 Single 或 File（editable）。")
         form = QtWidgets.QFormLayout()
         self.service = QtWidgets.QComboBox(); self.service.addItems(["ssh","ftp","http-get","http-post-form"])
         form.addRow("Service:", self.service)
@@ -633,24 +681,25 @@ class HydraPage(ToolPageBase):
             # 處理 ssh
             if self.user_single_rb.isChecked() and self.pass_single_rb.isChecked():
                 # 單一用戶名/密碼
-                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"ssh://{tgt}"]
+                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"{tgt} ssh"]
             else:
                 # 批量用戶名/密碼，這裡應該轉換文件路徑
                 user_file_path = self._convert_path_for_execution(self.user_file.text().strip(), use_wsl)
                 pass_file_path = self._convert_path_for_execution(self.pass_file.text().strip(), use_wsl)
-                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"ssh://{tgt}"]
+                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"{tgt} ssh"]
 
         elif svc == "ftp":
             # 處理 ftp
             if self.user_single_rb.isChecked() and self.pass_single_rb.isChecked():
                 # 單一用戶名/密碼
-                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"ftp://{tgt}"]
+                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"{tgt} ftp"]
             else:
                 # 批量用戶名/密碼，這裡應該轉換文件路徑
                 user_file_path = self._convert_path_for_execution(self.user_file.text().strip(), use_wsl)
                 pass_file_path = self._convert_path_for_execution(self.pass_file.text().strip(), use_wsl)
-                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"ftp://{tgt}"]
+                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"{tgt} ftp"]
 
+        cmd = ["wsl"] + cmd
         # 輸出命令並開始執行
         print(f"最終命令：{' '.join(cmd)}")
         self.start_worker(cmd)
@@ -668,7 +717,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # left nav - flat
         self.nav = QtWidgets.QListWidget(); self.nav.setFixedWidth(200); self.nav.setSpacing(0); self.nav.setMouseTracking(True)
         self.nav.setFont(QtGui.QFont("Segoe UI",10))
-        tools = ["whoami","ls","cat","ping","nc","nmap","traceroute","dig","curl","hydra"]
+        tools = ["系統資訊","檔案列表","內容查看","IP狀態查詢","傳輸測試","網路掃描","路由追蹤","DNS查詢","網頁請求","暴力破解"]
         for t in tools:
             it = QtWidgets.QListWidgetItem(t); it.setTextAlignment(QtCore.Qt.AlignVCenter)
             self.nav.addItem(it)
@@ -676,7 +725,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # content stack
         self.stack = QtWidgets.QStackedWidget(); main_h.addWidget(self.stack,1)
-        clsmap = {"whoami":WhoamiPage,"ls":LsPage,"cat":CatPage,"ping":PingPage,"nc":NcPage,"nmap":NmapPage,"traceroute":TraceroutePage,"dig":DigPage,"curl":CurlPage,"hydra":HydraPage}
+        clsmap = {"系統資訊":WhoamiPage,"檔案列表":LsPage,"內容查看":CatPage,"IP狀態查詢":PingPage,"傳輸測試":NcPage,"網路掃描":NmapPage,"路由追蹤":TraceroutePage,"DNS查詢":DigPage,"網頁請求":CurlPage,"暴力破解":HydraPage}
         self.pages = {}
         for name in tools:
             p = clsmap[name](self); self.pages[name] = p; self.stack.addWidget(p)
@@ -687,7 +736,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.encoding_label = QtWidgets.QLabel("編碼:")
         self.encoding_combo = QtWidgets.QComboBox()
         encs = ["utf-8","cp950","big5","gbk","shift_jis","iso-8859-1","windows-1252","euc-kr","utf-16"]
-        self.encoding_combo.addItems(encs); self.encoding_combo.setCurrentText("utf-8"); self.encoding_combo.setFixedWidth(140)
+        self.encoding_combo.addItems(encs); self.encoding_combo.setCurrentText("cp950"); self.set_encoding_based_on_wsl(False, initial=True); self.encoding_combo.setFixedWidth(140)
         self.status.addPermanentWidget(self.encoding_label); self.status.addPermanentWidget(self.encoding_combo)
         self.wsl_status_label = QtWidgets.QLabel(); self.wsl_status_label.setFixedWidth(160)
         self.status.addPermanentWidget(self.wsl_status_label)
@@ -696,6 +745,18 @@ class MainWindow(QtWidgets.QMainWindow):
         men = self.menuBar(); env = men.addMenu("Env")
         ac = QtWidgets.QAction("Check WSL Now", self); ac.triggered.connect(lambda: self._update_wsl_status(force=True)); env.addAction(ac)
         self.encoding_combo.currentTextChanged.connect(lambda t: self.status.showMessage(f"編碼: {t}",1500))
+        self.nav.currentRowChanged.connect(self._sync_encoding_on_page_change)
+    
+    def set_encoding_based_on_wsl(self, use_wsl: bool, initial=False):
+        """依據是否使用 WSL 自動切換右下角編碼"""
+        if use_wsl:
+            self.encoding_combo.setCurrentText("utf-8")
+            if not initial:
+                self.status.showMessage("已自動切換為 UTF-8（WSL 模式）", 2000)
+        else:
+            self.encoding_combo.setCurrentText("cp950")
+            if not initial:
+                self.status.showMessage("已自動切換為 CP950（Windows 模式）", 2000)
 
     def _update_wsl_status(self, initial=False, force=False):
         ok = wsl_available(force=force)
@@ -707,6 +768,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wsl_status_label.setText(html)
         if initial:
             self.status.showMessage("WSL 檢查完成", 1200)
+
+    def _sync_encoding_on_page_change(self, index):
+        page = self.stack.widget(index)
+        if hasattr(page, "use_wsl_ck"):
+            self.set_encoding_based_on_wsl(page.use_wsl_ck.isChecked())
 
 # ---------- run ----------
 def main():
