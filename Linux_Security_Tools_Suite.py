@@ -2,6 +2,10 @@ import sys, os, shlex, subprocess, shutil, time
 from PyQt5 import QtCore, QtGui, QtWidgets
 import subprocess, sys
 from PyQt5.QtCore import QThread, pyqtSignal
+import ipaddress
+import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import statistics
 
 if sys.platform.startswith("win"):  # silent
     _orig_popen = subprocess.Popen
@@ -309,51 +313,360 @@ class LsPage(ToolPageBase):
         form.addRow("Options:", self.opt)
         self.options_layout.addLayout(form)
     def on_start_clicked(self):
+        use_wsl = self.use_wsl_ck.isChecked()
         opts = self.opt.text().strip(); path = self.target_edit.text().strip() or "."
-        parts = ["wsl","ls"] + (shlex.split(opts) if opts else []) + [path]
+        if use_wsl:
+            parts = ["wsl","ls"] + (shlex.split(opts) if opts else []) + [path]
+        else:
+            parts = ["ls"] + (shlex.split(opts) if opts else []) + [path]    
         self.start_worker(parts)
 
+# ---------- CatPage (最終修正版) ----------
 class CatPage(ToolPageBase):
-    def __init__(self,parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("讀取並顯示檔案內容")
-        row = QtWidgets.QHBoxLayout()
-        self.auto_ck = QtWidgets.QCheckBox("Auto try encodings (utf-8 → cp950 → gbk)")
-        row.addWidget(self.auto_ck); row.addStretch()
-        self.options_layout.addLayout(row)
+        self.desc.setText("顯示檔案內容，支援自動編碼偵測與 WSL 模式。")
+        form = QtWidgets.QFormLayout()
+        self.auto_ck = QtWidgets.QCheckBox("自動判斷編碼")
+        self.auto_ck.setChecked(True)
+        form.addRow("", self.auto_ck)
+        self.options_layout.addLayout(form)
+
     def on_start_clicked(self):
         f = self.target_edit.text().strip()
+        use_wsl = self.use_wsl_ck.isChecked()
+
         if not f:
-            self.output.appendPlainText("[ERROR] 請輸入檔案路徑"); return
+            self.output.appendPlainText("[ERROR] 請輸入檔案路徑")
+            return
+
+        # --- ✅ 若勾選 WSL 模式：自動加上 'wsl' 前綴 ---
+        if use_wsl:
+            self.start_worker(["wsl", "cat", f])
+            return
+
+        # --- 若不是 WSL：檢查檔案是否存在 ---
         if not os.path.exists(f):
-            self.start_worker(["cat", f]); return
-        with open(f,"rb") as fh:
-            b = fh.read()
-        mw = self.main_window(); enc = mw.encoding_combo.currentText() if mw else "utf-8"
+            # 檔案不存在時仍執行系統 cat（例如 Linux 下）
+            self.start_worker(["cat", f])
+            return
+
+        # --- 若檔案存在，則嘗試直接讀取並顯示 ---
+        try:
+            with open(f, "rb") as fh:
+                b = fh.read()
+        except Exception as e:
+            self.output.appendPlainText(f"[ERROR] 無法讀取檔案: {e}")
+            return
+
+        # --- 取得主視窗編碼設定 ---
+        mw = self.main_window()
+        enc = mw.encoding_combo.currentText() if mw else "utf-8"
+
+        # --- 嘗試解碼內容 ---
         s = None
-        try: s = b.decode(enc)
+        try:
+            s = b.decode(enc)
         except Exception:
             if self.auto_ck.isChecked():
-                for e in ("utf-8","cp950","big5","gbk","utf-16"):
+                for e in ("utf-8", "cp950", "big5", "gbk", "utf-16"):
                     try:
-                        s = b.decode(e); enc = e; break
-                    except: s = None
+                        s = b.decode(e)
+                        enc = e
+                        break
+                    except:
+                        s = None
         if s is None:
             s = b.decode(enc, errors="replace")
             self.output.appendPlainText(f"[WARN] decode with {enc} (errors replaced)\n")
+
+        # --- 最終輸出內容 ---
         self.output.appendPlainText(s)
 
 class PingPage(ToolPageBase):
-    def __init__(self,parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("測試連線品質、延遲 (Count 可設定)。")
-        f = QtWidgets.QFormLayout()
+        self.desc.setText("測試連線品質、延遲 (Count 可設定)。支援範圍 Ping 與 Port 模式。")
+
+        form = QtWidgets.QFormLayout()
+
+        # count
         self.cnt = QtWidgets.QLineEdit("4")
-        f.addRow("Count:", self.cnt)
-        self.options_layout.addLayout(f)
+        form.addRow("Count:", self.cnt)
+
+        # port
+        self.port_edit = QtWidgets.QLineEdit()
+        self.port_edit.setPlaceholderText("輸入 Port (選填)")
+        form.addRow("Port:", self.port_edit)
+
+        # 範圍 Ping 勾選框
+        self.range_ck = QtWidgets.QCheckBox("範圍 Ping")
+        form.addRow("", self.range_ck)
+
+        # 起始與結束 IP 輸入框
+        self.range_widget = QtWidgets.QWidget()
+        range_layout = QtWidgets.QHBoxLayout(self.range_widget)
+        range_layout.setContentsMargins(0, 0, 0, 0)
+        self.start_ip = QtWidgets.QLineEdit()
+        self.end_ip = QtWidgets.QLineEdit()
+        self.start_ip.setPlaceholderText("起始 IP")
+        self.end_ip.setPlaceholderText("結束 IP")
+        range_layout.addWidget(QtWidgets.QLabel("從"))
+        range_layout.addWidget(self.start_ip)
+        range_layout.addWidget(QtWidgets.QLabel("到"))
+        range_layout.addWidget(self.end_ip)
+        self.range_widget.setVisible(False)
+
+        self.options_layout.addLayout(form)
+        self.options_layout.addWidget(self.range_widget)
+
+        # 切換範圍模式時顯示/隱藏輸入框
+        self.range_ck.toggled.connect(lambda v: self.range_widget.setVisible(v))
+
     def on_start_clicked(self):
-        t = self.target_edit.text().strip() or "8.8.8.8"; cnt = self.cnt.text().strip() or "4"
-        self.start_worker(["wsl","ping","-c",cnt,t])
+        use_wsl = self.use_wsl_ck.isChecked()
+        cnt = self.cnt.text().strip() or "4"
+        port = self.port_edit.text().strip()
+
+        if self.range_ck.isChecked():
+            # 範圍模式
+            start_ip = self.start_ip.text().strip()
+            end_ip = self.end_ip.text().strip()
+            if not start_ip or not end_ip:
+                self.output.appendPlainText("[ERROR] 請輸入起始與結束 IP")
+                return
+            try:
+                start_int = int(ipaddress.IPv4Address(start_ip))
+                end_int = int(ipaddress.IPv4Address(end_ip))
+            except Exception:
+                self.output.appendPlainText("[ERROR] IP 格式錯誤")
+                return
+            if end_int < start_int:
+                self.output.appendPlainText("[ERROR] 結束 IP 應大於起始 IP")
+                return
+            ip_list = [str(ipaddress.IPv4Address(i)) for i in range(start_int, end_int + 1)]
+            self._start_range_ping(ip_list, port, cnt, use_wsl)
+        else:
+            # 單一 IP
+            target = self.target_edit.text().strip() or "8.8.8.8"
+            if port:
+                self._start_single_port_ping(target, port, cnt, use_wsl)
+            else:
+                # ✅ 修正：WSL 最終指令需包含 'ping'
+                cnt_raw = self.cnt.text().strip()
+                try:
+                    cnt_num = str(int(''.join(ch for ch in cnt_raw if ch.isdigit())))
+                except:
+                    cnt_num = "4"
+
+                if use_wsl:
+                    # ✅ WSL 版本
+                    self.start_worker(["wsl", "ping", "-4", "-c", cnt_num, target])
+                else:
+                    # ✅ Windows 版本：手動拼出乾淨字串指令，交給 PowerShell -Command 執行
+                    cmd_str = f"ping -n {cnt_num} {target}"
+                    self.start_worker([cmd_str])
+
+    # --- helper: 實際跑一次 OS ping 並解析 time/ttl ---
+    def _run_os_ping_parse(self, ip, cnt, use_wsl):
+        """
+        執行系統 ping（依 WSL/Windows 自動選），回傳：
+          times_ms: List[int] 每次回覆的時間
+          ttl_val: Optional[int] 從回覆行解析到的 TTL（以第一個成功值為準，可能為 None）
+        """
+        if use_wsl:
+            cmd = ["wsl", "ping", "-c", str(cnt), ip]
+        else:
+            cmd = ["ping", "-n", str(cnt), ip]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            out = p.stdout or ""  # 有些系統在 stderr
+            lines = out.splitlines()
+
+            times_ms = []
+            ttl_val = None
+
+            # 支援 Windows 繁中/英，以及 WSL 英文格式
+            # 時間(ms)：可能是 "時間=4ms"、"time=4 ms"、"time<1ms"
+            time_pat = re.compile(r"(?:時間|time)\s*=?\s*<?\s*(\d+)\s*ms", re.IGNORECASE)
+            # TTL：可能是 "TTL=64"、"ttl=64"
+            ttl_pat = re.compile(r"(?:TTL|ttl)\s*=\s*(\d+)", re.IGNORECASE)
+
+            for ln in lines:
+                # 解析時間
+                mt = time_pat.search(ln)
+                if mt:
+                    try:
+                        times_ms.append(int(mt.group(1)))
+                    except:
+                        pass
+                # 解析 TTL（第一個成功值記錄下來）
+                if ttl_val is None:
+                    mt2 = ttl_pat.search(ln)
+                    if mt2:
+                        try:
+                            ttl_val = int(mt2.group(1))
+                        except:
+                            pass
+
+            return times_ms, ttl_val
+        except Exception:
+            return [], None
+
+    def _start_single_port_ping(self, target, port, cnt, use_wsl):
+        """單一 IP + Port 模式：模擬 tcping 行為，多次測試 TCP 連線並輸出延遲"""
+        import time
+        
+        self.output.clear()
+        self.output.appendPlainText(f"Ping {target}:{port} (使用 32 位元組的資料):\n")
+
+        times = []
+        success_count = 0
+
+        for i in range(int(cnt)):
+            start = time.time()
+            ok = False
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1.0)
+                res = sock.connect_ex((target, int(port)))
+                end = time.time()
+                sock.close()
+                if res == 0:
+                    ok = True
+            except Exception as e:
+                end = time.time()
+                ok = False
+
+            duration_ms = int(round((end - start) * 1000))
+            if ok:
+                success_count += 1
+                times.append(duration_ms)
+                # 即時輸出這次成功
+                self.output.appendPlainText(f"回覆自 {target}:{port}: 位元組=32 時間={duration_ms}ms")
+            else:
+                # 失敗的話也印出一句失敗
+                self.output.appendPlainText(f"連線超時 {target}:{port}")
+
+            QtWidgets.QApplication.processEvents()
+            # 可在兩次 probe 間稍微 sleep，以避免瞬間過度擁擠
+            time.sleep(0.1)
+
+        # 統計結果
+        sent = int(cnt)
+        received = success_count
+        lost = sent - received
+        loss_pct = int(round(lost * 100.0 / sent)) if sent else 0
+
+        self.output.appendPlainText(f"\n{target} 的 Ping 統計資料:")
+        self.output.appendPlainText(f"    封包: 已傳送 = {sent}，已收到 = {received}, 已遺失 = {lost} ({loss_pct}% 遺失)，")
+        if times:
+            self.output.appendPlainText(f"    時間 (毫秒): 最小 = {min(times)}，最大 = {max(times)}，平均 = {int(round(sum(times)/len(times)))}")
+        else:
+            self.output.appendPlainText("    時間 (毫秒): 無法取得")
+
+        # 最後顯示 port 狀態
+        self.output.appendPlainText(f"\n[PORT 狀態] {target}:{port} - {'Open' if received > 0 else 'Closed'}")
+
+    def _start_range_ping(self, ip_list, port, cnt, use_wsl):
+        """多線程範圍 Ping / Port 掃描（加入 4 次基底與 loss% 計算）"""
+        import re
+
+        self.output.clear()
+        self.output.appendPlainText("[多線程範圍 Ping 啟動]\n")
+        self.progress.setVisible(True)
+        self.progress.setRange(0, len(ip_list))
+        self.progress.setValue(0)
+
+        results = {}
+        futures = []
+        max_workers = min(64, len(ip_list))
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+
+        # --- 子任務：每個 IP 的 ping / port 檢測 ---
+        def ping_or_port(ip):
+            if port:
+                # 特定 port：TCP connect
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.8)
+                    ok = (sock.connect_ex((ip, int(port))) == 0)
+                    sock.close()
+                    return ip, ok, 0.0  # port 模式不算 loss%
+                except:
+                    return ip, False, 0.0
+            else:
+                # 一般 ping（4次基底）
+                if use_wsl:
+                    cmd = ["wsl", "ping", "-4", "-c", "4", ip]
+                else:
+                    cmd = ["ping", "-n", "4", ip]
+
+                try:
+                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                    out = (p.stdout or "").lower()
+
+                    # --- 解析封包資訊 ---
+                    if use_wsl:
+                        # Linux / WSL 格式：4 packets transmitted, 4 received, 0% packet loss
+                        m = re.search(r"(\d+)\s+packets\s+transmitted.*?(\d+)\s+received", out)
+                        if m:
+                            sent, received = int(m.group(1)), int(m.group(2))
+                        else:
+                            sent, received = 4, 0
+                    else:
+                        # Windows 格式：已傳送 = 4，已收到 = 4，已遺失 = 0
+                        m = re.search(r"已傳送\s*=\s*(\d+).*?已收到\s*=\s*(\d+).*?已遺失\s*=\s*(\d+)", out)
+                        if m:
+                            sent, received, lost = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                        else:
+                            # 英文版 fallback
+                            m2 = re.search(r"sent\s*=\s*(\d+).*?received\s*=\s*(\d+).*?lost\s*=\s*(\d+)", out)
+                            if m2:
+                                sent, received, lost = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+                            else:
+                                sent, received, lost = 4, 0, 4
+
+                    # --- 計算 loss% ---
+                    loss_rate = (1 - received / max(sent, 1)) * 100
+                    return ip, (received > 0), loss_rate
+
+                except:
+                    return ip, False, 100.0
+
+        # --- 建立所有任務 ---
+        for ip in ip_list:
+            futures.append(pool.submit(ping_or_port, ip))
+
+        completed = 0
+        for f in as_completed(futures):
+            ip, ok, loss = f.result()
+            results[ip] = (ok, loss)
+            completed += 1
+            self.progress.setValue(completed)
+
+            # --- 即時排序輸出 ---
+            sorted_ips = sorted(results.keys(), key=lambda x: tuple(map(int, x.split('.'))))
+            self.output.clear()
+            for ipx in sorted_ips:
+                okx, lossx = results[ipx]
+                tag = f"{ipx}:{port}" if port else ipx
+                if not okx or lossx >= 100.0:
+                    self.output.appendPlainText(f"🔴 [{tag}] Ping Fail")
+                else:
+                    loss_text = ""
+                    if lossx >= 1:
+                        # 取 25%,50%,75% 四個級距
+                        step = int(round(lossx / 25.0)) * 25
+                        if step >= 100: step = 100
+                        if step > 0:
+                            loss_text = f" [loss {step}%]"
+                    self.output.appendPlainText(f"🟢 [{tag}] Ping OK{loss_text}")
+            QtWidgets.QApplication.processEvents()
+
+        pool.shutdown(wait=False)
+        self.progress.setVisible(False)
+        self.output.appendPlainText("\n[Finished]")
 
 class NcPage(ToolPageBase):
     def __init__(self,parent=None):
@@ -504,7 +817,7 @@ class TraceroutePage(ToolPageBase):
         if is_windows() and not use_wsl:
             cmd = ["tracert"] + opts + [tgt]
         else:
-            cmd = ["traceroute"] + opts + [tgt]
+            cmd = ["wsl","traceroute"] + opts + [tgt]
         self.start_worker(cmd)
 
 class DigPage(ToolPageBase):
