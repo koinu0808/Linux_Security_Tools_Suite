@@ -1059,7 +1059,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ac = QtWidgets.QAction("Check WSL Now", self); ac.triggered.connect(lambda: self._update_wsl_status(force=True)); env.addAction(ac)
         self.encoding_combo.currentTextChanged.connect(lambda t: self.status.showMessage(f"編碼: {t}",1500))
         self.nav.currentRowChanged.connect(self._sync_encoding_on_page_change)
-    
+
     def set_encoding_based_on_wsl(self, use_wsl: bool, initial=False):
         """依據是否使用 WSL 自動切換右下角編碼"""
         if use_wsl:
