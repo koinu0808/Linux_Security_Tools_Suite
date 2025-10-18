@@ -975,44 +975,39 @@ class HydraPage(ToolPageBase):
         
         # 根據選擇的服務生成不同的命令格式
         if svc == "http-post-form" or svc == "http-get":
-            # 處理 http-get 或 http-post-form
+            # 處理 http-get-form / http-post-form
             path = self.hp_path.text().strip().lstrip("/")
             ufield = self.hp_userfield.text().strip() or "uid"
             pfield = self.hp_passfield.text().strip() or "passw"
-            extra = self.hp_extrafield.text().strip(); fail = self.hp_failstr.text().strip() or "Login Failed"
-            
+            extra = self.hp_extrafield.text().strip()
+            fail = self.hp_failstr.text().strip() or "Login Failed"
+
             params = f"{ufield}=^USER^&{pfield}=^PASS^"
             if extra:
                 params += extra if extra.startswith("&") else "&" + extra
-            
+
             form = f"/{path}:{params}:{fail}"
-            proto = "https-post-form" if svc == "http-post-form" else "http-get-form"  # 區分 http-get 和 http-post-form
-            
+
+            # 根據 service + HTTPS 勾選決定協定
+            if svc == "http-post-form":
+                proto = "https-post-form" if self.hp_https_ck.isChecked() else "http-post-form"
+            elif svc == "http-get":
+                proto = "https-get-form" if self.hp_https_ck.isChecked() else "http-get-form"
+            else:
+                proto = svc  # fallback，理論上不會到這裡
+
             cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} {proto} \"{form}\""]
 
         elif svc == "ssh":
             # 處理 ssh
-            if self.user_single_rb.isChecked() and self.pass_single_rb.isChecked():
-                # 單一用戶名/密碼
-                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"{tgt} ssh"]
-            else:
-                # 批量用戶名/密碼，這裡應該轉換文件路徑
-                user_file_path = self._convert_path_for_execution(self.user_file.text().strip(), use_wsl)
-                pass_file_path = self._convert_path_for_execution(self.pass_file.text().strip(), use_wsl)
-                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"{tgt} ssh"]
+            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} ssh"]
 
         elif svc == "ftp":
             # 處理 ftp
-            if self.user_single_rb.isChecked() and self.pass_single_rb.isChecked():
-                # 單一用戶名/密碼
-                cmd = ["hydra", "-l", self.user_single.text().strip(), "-p", self.pass_single.text().strip(), "-t", threads, f"{tgt} ftp"]
-            else:
-                # 批量用戶名/密碼，這裡應該轉換文件路徑
-                user_file_path = self._convert_path_for_execution(self.user_file.text().strip(), use_wsl)
-                pass_file_path = self._convert_path_for_execution(self.pass_file.text().strip(), use_wsl)
-                cmd = ["hydra", "-L", user_file_path, "-P", pass_file_path, "-t", threads, f"{tgt} ftp"]
+            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} ftp"]
 
-        cmd = ["wsl"] + cmd
+        if use_wsl:
+            cmd = ["wsl"] + cmd
         # 輸出命令並開始執行
         print(f"最終命令：{' '.join(cmd)}")
         self.start_worker(cmd)
