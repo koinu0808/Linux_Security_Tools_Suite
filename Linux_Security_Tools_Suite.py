@@ -1,11 +1,10 @@
-import sys, os, shlex, subprocess, shutil, time
+import sys, os, shlex, subprocess, shutil, time, re, threading
 from PyQt5 import QtCore, QtGui, QtWidgets
 import subprocess, sys
 from PyQt5.QtCore import QThread, pyqtSignal
 import ipaddress
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import statistics
 
 if sys.platform.startswith("win"):  # silent
     _orig_popen = subprocess.Popen
@@ -1012,6 +1011,173 @@ class HydraPage(ToolPageBase):
         print(f"最終命令：{' '.join(cmd)}")
         self.start_worker(cmd)
 
+class SshPage(ToolPageBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.desc.setText("使用 WSL SSH 連線遠端主機，可輸入命令並即時取得輸出結果。")
+
+        # --- 帳號密碼輸入 ---
+        form = QtWidgets.QFormLayout()
+        h = QtWidgets.QHBoxLayout()
+        self.user_edit = QtWidgets.QLineEdit()
+        self.user_edit.setPlaceholderText("username")
+        self.pass_edit = QtWidgets.QLineEdit()
+        self.pass_edit.setPlaceholderText("password (留空則使用金鑰登入)")
+        self.pass_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        h.addWidget(self.user_edit)
+        h.addWidget(QtWidgets.QLabel("/"))
+        h.addWidget(self.pass_edit)
+        form.addRow("帳號 / 密碼:", h)
+
+        self.port_edit = QtWidgets.QLineEdit()
+        self.port_edit.setPlaceholderText("22 (預設)")
+        form.addRow("Port:", self.port_edit)
+        self.options_layout.addLayout(form)
+
+        # --- 命令輸入欄 ---
+        cmd_bar = QtWidgets.QHBoxLayout()
+        self.cmd_edit = QtWidgets.QLineEdit()
+        self.cmd_edit.setPlaceholderText("輸入指令（例如：ls、pwd、cat /etc/passwd ...）")
+        self.cmd_edit.returnPressed.connect(self._exec_command)
+        self.cmd_btn = QtWidgets.QPushButton("執行")
+        self.cmd_btn.clicked.connect(self._exec_command)
+        cmd_bar.addWidget(self.cmd_edit)
+        cmd_bar.addWidget(self.cmd_btn)
+        self.layout().addLayout(cmd_bar)
+
+        # --- 輸出區（純輸出） ---
+        self.output.setReadOnly(True)
+        self.output.setPlaceholderText("SSH 輸出結果將顯示在此")
+        self.output.setFont(QtGui.QFont("Consolas", 10))
+
+        self._proc = None
+        self._reader_thread = None
+        self._connected = False
+
+    def on_start_clicked(self):
+        host = self.target_edit.text().strip()
+        user = self.user_edit.text().strip()
+        pw = self.pass_edit.text().strip()
+        port = self.port_edit.text().strip() or "22"
+
+        if not host or not user:
+            self.output.appendPlainText("[ERROR] 請輸入主機與帳號")
+            return
+
+        self.output.clear()
+        self.output.appendPlainText(f"嘗試連線 {user}@{host}:{port} ...\n")
+
+        # --- 組合 SSH 指令 ---
+        if pw:
+            bash_cmd = (
+                f"sshpass -p '{pw}' ssh -tt "
+                f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                f"{user}@{host} -p {port}"
+            )
+        else:
+            bash_cmd = (
+                f"ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                f"{user}@{host} -p {port}"
+            )
+
+        cmd = ["wsl", "-e", "bash", "-l", "-c", bash_cmd]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                bufsize=1
+            )
+            self._connected = True
+            self.output.appendPlainText("✅ SSH 已啟動，可輸入命令或使用上方欄位執行。\n")
+
+            # 啟動非阻塞讀取執行緒
+            self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
+            self._reader_thread.start()
+
+        except Exception as e:
+            self.output.appendPlainText(f"[ERROR] 無法啟動 SSH：{e}")
+
+    def _read_output(self):
+        # 移除 ANSI 顏色碼與 OSC 控制序列（含 \x1b]0;... 類型）
+        ansi_osc_escape = re.compile(
+            r'\x1B\][^\x07]*\x07'  # 抓出 \x1b]0;... \x07 整段
+            r'|\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])'  # 抓出顏色控制碼
+        )
+
+        if not self._proc:
+            return
+
+        prompt_pat = re.compile(r'^[\w\-.]+@[\w\-.]+[:].*[$#]\s*$')
+        banner_pat = re.compile(r'^(Welcome|Last login|Linux|Ubuntu|Authorized|Type "help"|Documentation|Support|Management|Expanded Security|Learn more|New release|\s*$)')
+
+        started = False
+        for line in iter(self._proc.stdout.readline, ''):
+            if not line:
+                break
+
+            # 去除控制碼與換行
+            clean_line = ansi_osc_escape.sub('', line).rstrip('\r\n')
+
+            # 登入初始階段：過濾空白、banner、prompt、控制碼產生的空字串
+            if not started:
+                if (
+                    clean_line.strip() == "" or
+                    banner_pat.match(clean_line) or
+                    prompt_pat.match(clean_line)
+                ):
+                    continue
+                started = True
+
+            # 執行過程中：過濾 prompt
+            if prompt_pat.match(clean_line):
+                continue
+
+            QtCore.QMetaObject.invokeMethod(
+                self.output,
+                "appendPlainText",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(str, clean_line)
+            )
+
+        self._proc.wait()
+
+
+    def _exec_command(self):
+        if not self._proc or self._proc.poll() is not None:
+            return
+
+        cmd = self.cmd_edit.text().strip()
+        if not cmd:
+            return
+
+        try:
+            if not cmd.endswith("\n"):
+                cmd += "\n"
+            self._proc.stdin.write(cmd)
+            self._proc.stdin.flush()
+            self.cmd_edit.clear()
+        except Exception as e:
+            QtCore.QMetaObject.invokeMethod(
+                self.output,
+                "appendPlainText",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(str, f"[ERROR] 指令送出失敗: {e}")
+            )
+
+    def on_stop_clicked(self):
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except:
+                pass
+        self._connected = False
+        self.output.appendPlainText("[SSH 連線結束]")
+
 # ---------- main window ----------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
@@ -1025,7 +1191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # left nav - flat
         self.nav = QtWidgets.QListWidget(); self.nav.setFixedWidth(200); self.nav.setSpacing(0); self.nav.setMouseTracking(True)
         self.nav.setFont(QtGui.QFont("Segoe UI",10))
-        tools = ["系統資訊","檔案列表","內容查看","IP狀態查詢","傳輸測試","網路掃描","路由追蹤","DNS查詢","網頁請求","暴力破解"]
+        tools = ["系統資訊","檔案列表","內容查看","IP狀態查詢","傳輸測試","網路掃描","路由追蹤","DNS查詢","網頁請求","暴力破解","SSH連線"]
         for t in tools:
             it = QtWidgets.QListWidgetItem(t); it.setTextAlignment(QtCore.Qt.AlignVCenter)
             self.nav.addItem(it)
@@ -1033,7 +1199,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # content stack
         self.stack = QtWidgets.QStackedWidget(); main_h.addWidget(self.stack,1)
-        clsmap = {"系統資訊":WhoamiPage,"檔案列表":LsPage,"內容查看":CatPage,"IP狀態查詢":PingPage,"傳輸測試":NcPage,"網路掃描":NmapPage,"路由追蹤":TraceroutePage,"DNS查詢":DigPage,"網頁請求":CurlPage,"暴力破解":HydraPage}
+        clsmap = {"系統資訊":WhoamiPage,"檔案列表":LsPage,"內容查看":CatPage,"IP狀態查詢":PingPage,"傳輸測試":NcPage,"網路掃描":NmapPage,"路由追蹤":TraceroutePage,"DNS查詢":DigPage,"網頁請求":CurlPage,"暴力破解":HydraPage,"SSH連線": SshPage}
         self.pages = {}
         for name in tools:
             p = clsmap[name](self); self.pages[name] = p; self.stack.addWidget(p)
