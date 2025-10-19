@@ -320,67 +320,186 @@ class LsPage(ToolPageBase):
             parts = ["ls"] + (shlex.split(opts) if opts else []) + [path]    
         self.start_worker(parts)
 
-# ---------- CatPage (最終修正版) ----------
 class CatPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("顯示檔案內容，支援自動編碼偵測與 WSL 模式。")
-        form = QtWidgets.QFormLayout()
+        self.desc.setText("顯示或比對檔案內容，支援自動編碼偵測與 WSL 模式。")
+
+        # --- 隱藏上方 target 區塊，並移除其空白高度 ---
+        self.target_label.hide()
+        self.target_edit.hide()
+        if hasattr(self, 'use_wsl_ck'):
+            self.use_wsl_ck.hide()
+        # 嘗試縮減原 top layout 的高度
+        top_item = self.layout().itemAt(1)
+        if top_item and isinstance(top_item, QtWidgets.QLayout):
+            top_item.setContentsMargins(0, 0, 0, 0)
+            top_item.setSpacing(0)
+            for i in range(top_item.count()):
+                item = top_item.itemAt(i)
+                w = item.widget()
+                if w:
+                    w.setVisible(False)
+
+        # --- 模式切換 ---
+        mode_layout = QtWidgets.QHBoxLayout()
+        self.single_mode_rb = QtWidgets.QRadioButton("單檔模式")
+        self.diff_mode_rb = QtWidgets.QRadioButton("比對模式")
+        self.single_mode_rb.setChecked(True)
+        mode_layout.addWidget(self.single_mode_rb)
+        mode_layout.addWidget(self.diff_mode_rb)
+        mode_layout.addStretch()
+        self.options_layout.addLayout(mode_layout)
+        self.options_layout.addSpacing(10)
+
+        # --- 單檔模式 ---
+        self.single_widget = QtWidgets.QWidget()
+        s_form = QtWidgets.QGridLayout(self.single_widget)
+        s_form.setContentsMargins(5, 5, 5, 5)
+        s_form.setHorizontalSpacing(10)
+        s_form.setVerticalSpacing(8)
+
         self.auto_ck = QtWidgets.QCheckBox("自動判斷編碼")
         self.auto_ck.setChecked(True)
-        form.addRow("", self.auto_ck)
-        self.options_layout.addLayout(form)
+        s_form.addWidget(self.auto_ck, 0, 0, 1, 2)
+
+        self.single_file_edit = QtWidgets.QLineEdit()
+        self.single_file_btn = QtWidgets.QPushButton("Browse")
+        self.single_file_btn.setFixedWidth(100)
+        s_form.addWidget(QtWidgets.QLabel("File:"), 1, 0)
+        s_form.addWidget(self.single_file_edit, 1, 1)
+        s_form.addWidget(self.single_file_btn, 1, 2)
+
+        # --- 比對模式 ---
+        self.diff_widget = QtWidgets.QWidget()
+        d_form = QtWidgets.QFormLayout(self.diff_widget)
+        self.file1_edit = QtWidgets.QLineEdit()
+        self.file2_edit = QtWidgets.QLineEdit()
+        self.browse1_btn = QtWidgets.QPushButton("Browse")
+        self.browse2_btn = QtWidgets.QPushButton("Browse")
+        b1 = QtWidgets.QHBoxLayout(); b1.addWidget(self.file1_edit); b1.addWidget(self.browse1_btn)
+        b2 = QtWidgets.QHBoxLayout(); b2.addWidget(self.file2_edit); b2.addWidget(self.browse2_btn)
+        d_form.addRow("File1:", b1)
+        d_form.addRow("File2:", b2)
+
+        # --- stack 切換區 ---
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self.single_widget)
+        self.stack.addWidget(self.diff_widget)
+        self.options_layout.addWidget(self.stack)
+
+        # --- 事件連接 ---
+        self.single_mode_rb.toggled.connect(lambda v: self._toggle_mode(v))
+        self.browse1_btn.clicked.connect(lambda: self._choose_file(self.file1_edit))
+        self.browse2_btn.clicked.connect(lambda: self._choose_file(self.file2_edit))
+        self.single_file_btn.clicked.connect(lambda: self._choose_file(self.single_file_edit))
+
+    def _toggle_mode(self, single_mode):
+        """切換單檔/比對模式時調整版面"""
+        if single_mode:
+            self.stack.setCurrentIndex(0)
+            self.stack.setMaximumHeight(100)
+        else:
+            self.stack.setCurrentIndex(1)
+            self.stack.setMaximumHeight(200)
+
+        # ✅ 切換模式時強制清除輸出，避免樣式殘留
+        self.output.clear()
+        self.output.setPlainText("")  # 重設文字格式狀態
+
+    def _choose_file(self, target_edit):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇檔案")
+        if p:
+            target_edit.setText(p)
 
     def on_start_clicked(self):
-        f = self.target_edit.text().strip()
         use_wsl = self.use_wsl_ck.isChecked()
 
-        if not f:
-            self.output.appendPlainText("[ERROR] 請輸入檔案路徑")
+        # === 單檔模式 ===
+        if self.single_mode_rb.isChecked():
+            f = self.single_file_edit.text().strip()
+            if not f:
+                self.output.appendPlainText("[ERROR] 請選擇檔案")
+                return
+
+            # ✅ 每次執行時都重設輸出格式
+            self.output.clear()
+            self.output.setPlainText("")
+
+            if use_wsl:
+                self.start_worker(["wsl", "cat", f])
+                return
+
+            if os.path.exists(f):
+                try:
+                    with open(f, "rb") as fh:
+                        b = fh.read()
+                except Exception as e:
+                    self.output.appendPlainText(f"[ERROR] 無法讀取檔案: {e}")
+                    return
+            else:
+                self.start_worker(["cat", f])
+                return
+
+            mw = self.main_window()
+            enc = mw.encoding_combo.currentText() if mw else "utf-8"
+            s = None
+            try:
+                s = b.decode(enc)
+            except Exception:
+                if self.auto_ck.isChecked():
+                    for e in ("utf-8", "cp950", "big5", "gbk", "utf-16"):
+                        try:
+                            s = b.decode(e)
+                            enc = e
+                            break
+                        except:
+                            s = None
+            if s is None:
+                s = b.decode(enc, errors="replace")
+                self.output.appendPlainText(f"[WARN] decode with {enc} (errors replaced)\n")
+
+            self.output.appendPlainText(s)
             return
 
-        # --- ✅ 若勾選 WSL 模式：自動加上 'wsl' 前綴 ---
-        if use_wsl:
-            self.start_worker(["wsl", "cat", f])
+        # === 比對模式 ===
+        f1 = self.file1_edit.text().strip()
+        f2 = self.file2_edit.text().strip()
+        if not f1 or not f2:
+            self.output.appendPlainText("[ERROR] 請選擇兩個檔案進行比對")
+            return
+        if not os.path.exists(f1) or not os.path.exists(f2):
+            self.output.appendPlainText("[ERROR] 檔案不存在")
             return
 
-        # --- 若不是 WSL：檢查檔案是否存在 ---
-        if not os.path.exists(f):
-            # 檔案不存在時仍執行系統 cat（例如 Linux 下）
-            self.start_worker(["cat", f])
-            return
+        mw = self.main_window()
+        enc = mw.encoding_combo.currentText() if mw else "utf-8"
 
-        # --- 若檔案存在，則嘗試直接讀取並顯示 ---
         try:
-            with open(f, "rb") as fh:
-                b = fh.read()
+            with open(f1, "r", encoding=enc, errors="ignore") as a, open(f2, "r", encoding=enc, errors="ignore") as b:
+                a_lines = a.readlines()
+                b_lines = b.readlines()
         except Exception as e:
             self.output.appendPlainText(f"[ERROR] 無法讀取檔案: {e}")
             return
 
-        # --- 取得主視窗編碼設定 ---
-        mw = self.main_window()
-        enc = mw.encoding_combo.currentText() if mw else "utf-8"
+        import difflib
+        diff = list(difflib.unified_diff(a_lines, b_lines, fromfile=f1, tofile=f2, lineterm=""))
+        self.output.clear()
+        self.output.setPlainText("")  # ✅ 保證每次比對都重設文字格式
 
-        # --- 嘗試解碼內容 ---
-        s = None
-        try:
-            s = b.decode(enc)
-        except Exception:
-            if self.auto_ck.isChecked():
-                for e in ("utf-8", "cp950", "big5", "gbk", "utf-16"):
-                    try:
-                        s = b.decode(e)
-                        enc = e
-                        break
-                    except:
-                        s = None
-        if s is None:
-            s = b.decode(enc, errors="replace")
-            self.output.appendPlainText(f"[WARN] decode with {enc} (errors replaced)\n")
+        for line in diff:
+            if line.startswith("+") and not line.startswith("+++"):
+                color = "#2ecc71"  # 新增
+                self.output.appendHtml(f"<span style='color:{color}'>{line}</span>")
+            elif line.startswith("-") and not line.startswith("---"):
+                color = "#e74c3c"  # 刪除
+                self.output.appendHtml(f"<span style='color:{color}'>{line}</span>")
+            else:
+                color = "#95a5a6"  # 保留
+                self.output.appendHtml(f"<span style='color:{color}'>{line}</span>")
 
-        # --- 最終輸出內容 ---
-        self.output.appendPlainText(s)
+        self.output.appendPlainText("\n[Finished]")
 
 class PingPage(ToolPageBase):
     def __init__(self, parent=None):
@@ -1362,4 +1481,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
