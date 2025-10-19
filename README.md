@@ -1,8 +1,18 @@
 ﻿# Linux_Security_Tools_Suite
 
 Linux資安工具整合
- 
+
 ---
+
+## 開始之前請先下載 `PyQt5` 、 `sshpass` 、 `其他所有套件`
+
+> PyQt5
+將以下文字貼入 Windows PowerShell 中使用  
+ ``` pip install PyQt5 ```
+
+> sshpass
+將以下文字貼入 WSL bash 中使用  
+ ``` sudo apt install sshpass ```
 
 直接開啟.exe執行檔即可使用  
 執行檔位置於: /Linux_Security_Tools_Suite/dist/Linux_Security_Tools_Suite.exe
@@ -21,6 +31,7 @@ Linux資安工具整合
 - DNS查詢: 查詢DNS、IP、Domain
 - 網頁請求: HTTP(S)客戶端，可查詢HTML、HEADER ....等
 - 暴力破解: 強大的暴力破解工具，可使用SSH、FTP、http(s)-get、http(S)-post-form
+- SSH連線: 可使用IP位址搭配帳號密碼以command line方式遠端連線
 
 > 暴力破解 http-post-form
 - HTTP PATH: 要破解的網站當前分頁 `Ex: 192.168.1.1/login.html` 就輸入 `/login.html`
