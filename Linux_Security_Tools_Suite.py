@@ -1310,7 +1310,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # left nav - flat
         self.nav = QtWidgets.QListWidget(); self.nav.setFixedWidth(200); self.nav.setSpacing(0); self.nav.setMouseTracking(True)
         self.nav.setFont(QtGui.QFont("Segoe UI",10))
-        tools = ["系統資訊","檔案列表","內容查看","IP狀態查詢","傳輸測試","網路掃描","路由追蹤","DNS查詢","網頁請求","暴力破解","SSH連線"]
+        tools = ["顯示當前裝置資訊","檔案列表","查看文件內容","IP狀態查詢","傳輸測試","埠口掃描","路由追蹤","DNS查詢","網頁原始碼擷取","弱密碼測試","SSH連線"]
         for t in tools:
             it = QtWidgets.QListWidgetItem(t); it.setTextAlignment(QtCore.Qt.AlignVCenter)
             self.nav.addItem(it)
@@ -1318,7 +1318,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # content stack
         self.stack = QtWidgets.QStackedWidget(); main_h.addWidget(self.stack,1)
-        clsmap = {"系統資訊":WhoamiPage,"檔案列表":LsPage,"內容查看":CatPage,"IP狀態查詢":PingPage,"傳輸測試":NcPage,"網路掃描":NmapPage,"路由追蹤":TraceroutePage,"DNS查詢":DigPage,"網頁請求":CurlPage,"暴力破解":HydraPage,"SSH連線": SshPage}
+        clsmap = {"顯示當前裝置資訊":WhoamiPage,"檔案列表":LsPage,"查看文件內容":CatPage,"IP狀態查詢":PingPage,"傳輸測試":NcPage,"埠口掃描":NmapPage,"路由追蹤":TraceroutePage,"DNS查詢":DigPage,"網頁原始碼擷取":CurlPage,"弱密碼測試":HydraPage,"SSH連線": SshPage}
         self.pages = {}
         for name in tools:
             p = clsmap[name](self); self.pages[name] = p; self.stack.addWidget(p)
