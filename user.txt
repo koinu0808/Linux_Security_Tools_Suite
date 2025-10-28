@@ -5,6 +5,7 @@ qazwsx
 letmein
 admin
 yhchen
+ubuntu
 kali
 koinu
 P@ssw0rd!
