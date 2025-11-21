@@ -1,6 +1,5 @@
 import sys, os, shlex, subprocess, shutil, time, re, threading
 from PyQt5 import QtCore, QtGui, QtWidgets
-import subprocess, sys
 from PyQt5.QtCore import QThread, pyqtSignal
 import ipaddress
 import socket
@@ -929,138 +928,258 @@ class HydraPage(ToolPageBase):
 class SshPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("使用 WSL SSH 連線遠端主機，可輸入命令並即時取得輸出結果。")
-        form = QtWidgets.QFormLayout()
-        h = QtWidgets.QHBoxLayout()
-        self.user_edit = QtWidgets.QLineEdit()
-        self.user_edit.setPlaceholderText("username")
-        self.pass_edit = QtWidgets.QLineEdit()
-        self.pass_edit.setPlaceholderText("password (留空則使用金鑰登入)")
-        self.pass_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        h.addWidget(self.user_edit)
-        h.addWidget(QtWidgets.QLabel("/"))
-        h.addWidget(self.pass_edit)
-        form.addRow("帳號 / 密碼:", h)
-        self.port_edit = QtWidgets.QLineEdit()
-        self.port_edit.setPlaceholderText("22 (預設)")
-        form.addRow("Port:", self.port_edit)
-        self.options_layout.addLayout(form)
-        cmd_bar = QtWidgets.QHBoxLayout()
-        self.cmd_edit = QtWidgets.QLineEdit()
-        self.cmd_edit.setPlaceholderText("輸入指令（例如：ls、pwd、cat /etc/passwd ...）")
-        self.cmd_edit.returnPressed.connect(self._exec_command)
-        self.cmd_btn = QtWidgets.QPushButton("執行")
-        self.cmd_btn.clicked.connect(self._exec_command)
-        cmd_bar.addWidget(self.cmd_edit)
-        cmd_bar.addWidget(self.cmd_btn)
-        self.layout().addLayout(cmd_bar)
-        self.output.setReadOnly(True)
-        self.output.setPlaceholderText("SSH 輸出結果將顯示在此")
-        self.output.setFont(QtGui.QFont("Consolas", 10))
-        self._proc = None
-        self._reader_thread = None
-        self._connected = False
+        self.desc.setText("互動式 SSH 終端機")
 
+        # ================= UI：SSH 設定表單 =================
+        form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(QtCore.Qt.AlignRight)
+
+        self.user_edit = QtWidgets.QLineEdit("")
+        self.user_edit.setPlaceholderText("預設 root、ubuntu、ec2-user...")
+        form.addRow("Username:", self.user_edit)
+
+        # 登入方式
+        auth_box = QtWidgets.QGroupBox("登入方式")
+        auth_layout = QtWidgets.QHBoxLayout(auth_box)
+        self.pass_rb = QtWidgets.QRadioButton("密碼登入")
+        self.key_rb  = QtWidgets.QRadioButton("金鑰登入")
+        self.pass_rb.setChecked(True)
+        auth_layout.addWidget(self.pass_rb)
+        auth_layout.addWidget(self.key_rb)
+        auth_layout.addStretch()
+        form.addRow(auth_box)
+
+        # 密碼區
+        self.pass_widget = QtWidgets.QWidget()
+        p_lay = QtWidgets.QHBoxLayout(self.pass_widget)
+        p_lay.setContentsMargins(0, 4, 0, 4)
+        self.pass_edit = QtWidgets.QLineEdit()
+        self.pass_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        p_lay.addWidget(QtWidgets.QLabel("Password:"))
+        p_lay.addWidget(self.pass_edit, 1)
+        form.addRow(self.pass_widget)
+
+        # 金鑰區
+        self.key_widget = QtWidgets.QWidget()
+        self.key_widget.setVisible(False)
+        k_lay = QtWidgets.QGridLayout(self.key_widget)
+        self.key_edit = QtWidgets.QLineEdit()
+        self.key_browse = QtWidgets.QPushButton("Browse")
+        self.passphrase_edit = QtWidgets.QLineEdit()
+        self.passphrase_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        k_lay.addWidget(QtWidgets.QLabel("Private Key:"), 0, 0)
+        k_lay.addWidget(self.key_edit, 0, 1)
+        k_lay.addWidget(self.key_browse, 0, 2)
+        k_lay.addWidget(QtWidgets.QLabel("Key Password:"), 1, 0)
+        k_lay.addWidget(self.passphrase_edit, 1, 1, 1, 2)
+        form.addRow(self.key_widget)
+
+        self.port_edit = QtWidgets.QLineEdit("22")
+        self.port_edit.setFixedWidth(80)
+        form.addRow("Port:", self.port_edit)
+
+        self.options_layout.addLayout(form)
+
+        # ================= 偽終端輸出區（只讀） =================
+        self.output.setReadOnly(True)
+        self.output.setFont(QtGui.QFont("Consolas", 11))
+        self.output.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                selection-background-color: #264f78;
+            }
+        """)
+
+        # ================= 新增：真正安全的輸入框 =================
+        self.input = QtWidgets.QLineEdit()
+        self.input.setPlaceholderText("輸入指令... 按 Enter 執行")
+        self.layout().addWidget(self.input)
+
+        # ================= 狀態 =================
+        self._proc = None
+        self._connected = False
+        self._history = []
+        self._history_index = -1
+
+        # ================= 事件 =================
+        self.pass_rb.toggled.connect(lambda c: self.pass_widget.setVisible(c))
+        self.key_rb.toggled.connect(lambda c: self.key_widget.setVisible(c))
+        self.key_browse.clicked.connect(self._browse_key)
+
+        self.input.returnPressed.connect(self._send_command)
+        self.input.installEventFilter(self)
+
+    # ------------------------------------------------------------
+    # 金鑰
+    # ------------------------------------------------------------
+    def _browse_key(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇私鑰檔案", "", "All Files (*)")
+        if path:
+            self.key_edit.setText(path)
+
+    # ------------------------------------------------------------
+    # 覆寫 eventFilter：用於輸入框處理上下鍵
+    # ------------------------------------------------------------
+    def eventFilter(self, obj, event):
+        if obj == self.input and event.type() == QtCore.QEvent.KeyPress:
+            key = event.key()
+            if key == QtCore.Qt.Key_Up:
+                self._history_prev()
+                return True
+            if key == QtCore.Qt.Key_Down:
+                self._history_next()
+                return True
+        return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------
+    # 送出指令
+    # ------------------------------------------------------------
+    def _send_command(self):
+        if not self._connected or not self._proc:
+            return
+        line = self.input.text().strip()
+        if not line:
+            return
+
+        # 顯示在 output
+        self.output.appendPlainText(f"$ {line}")
+
+        # 歷史
+        if not self._history or self._history[-1] != line:
+            self._history.append(line)
+        self._history_index = len(self._history)
+
+        # 實際送到 SSH
+        try:
+            self._proc.stdin.write((line + "\n").encode())
+            self._proc.stdin.flush()
+        except Exception:
+            self.output.appendPlainText("[ERROR] 指令無法送出 (連線已中斷)")
+            self._connected = False
+
+        self.input.clear()
+
+    # ------------------------------------------------------------
+    # 指令歷史
+    # ------------------------------------------------------------
+    def _history_prev(self):
+        if self._history_index <= 0:
+            return
+        self._history_index -= 1
+        self.input.setText(self._history[self._history_index])
+
+    def _history_next(self):
+        if self._history_index >= len(self._history):
+            self.input.clear()
+            return
+        self._history_index += 1
+        if self._history_index == len(self._history):
+            self.input.clear()
+        else:
+            self.input.setText(self._history[self._history_index])
+
+    # ------------------------------------------------------------
+    # SSH Reader Thread
+    # ------------------------------------------------------------
+    def _start_reader(self):
+        def reader():
+            while self._connected and self._proc:
+                try:
+                    data = self._proc.stdout.read(1024)
+                    if not data:
+                        break
+                    text = data.decode(errors="replace")
+                    text = re.sub(r"\[[0-?]*[ -/]*[@-~]", "", text)
+                    QtCore.QMetaObject.invokeMethod(
+                        self.output,
+                        "appendPlainText",
+                        QtCore.Qt.QueuedConnection,
+                        QtCore.Q_ARG(str, text.rstrip(""))
+                    )
+                except:
+                    break
+
+            self._connected = False
+            QtCore.QMetaObject.invokeMethod(
+                self.output,
+                "appendPlainText",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(str, "[!] 連線已中斷")
+            )
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    # ------------------------------------------------------------
+    # 連線
+    # ------------------------------------------------------------
     def on_start_clicked(self):
         host = self.target_edit.text().strip()
-        user = self.user_edit.text().strip()
-        pw = self.pass_edit.text().strip()
+        user = self.user_edit.text().strip() or "root"
         port = self.port_edit.text().strip() or "22"
-        if not host or not user:
-            self.output.appendPlainText("[ERROR] 請輸入主機與帳號")
-            return
+
         self.output.clear()
-        self.output.appendPlainText(f"嘗試連線 {user}@{host}:{port} ...\n")
-        if pw:
-            bash_cmd = (
-                f"sshpass -p '{pw}' ssh -tt "
-                f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-                f"{user}@{host} -p {port}"
-            )
+        self.output.appendPlainText(f"[*] 正在連線 {user}@{host}:{port} ...")
+
+        use_wsl = self.use_wsl_ck.isChecked()
+        cmd = ["ssh", "-tt", "-p", port, "-o", "StrictHostKeyChecking=no", f"{user}@{host}"]
+
+        if self.key_rb.isChecked():
+            key = self.key_edit.text().strip()
+            if key:
+                cmd.insert(1, "-i")
+                cmd.insert(2, key)
         else:
-            bash_cmd = (
-                f"ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-                f"{user}@{host} -p {port}"
-            )
-        cmd = ["wsl", "-e", "bash", "-l", "-c", bash_cmd]
+            pw = self.pass_edit.text().strip()
+            if not pw:
+                self.output.appendPlainText("[ERROR] 密碼不能為空！")
+                return
+
+            cmd = [
+                "env", f"SSHPASS={pw}",
+                "sshpass", "-e",
+                "ssh", "-tt",
+                "-p", port,
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                f"{user}@{host}"
+            ]
+
+        if use_wsl:
+            cmd = ["wsl"] + cmd
+
         try:
             self._proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                bufsize=1
+                bufsize=0,
+                universal_newlines=False
             )
             self._connected = True
-            self.output.appendPlainText("SSH 已啟動，可輸入命令或使用上方欄位執行。\n")
-            self._reader_thread = threading.Thread(target=self._read_output, daemon=True)
-            self._reader_thread.start()
+            self._start_reader()
+
         except Exception as e:
-            self.output.appendPlainText(f"[ERROR] 無法啟動 SSH：{e}")
+            self.output.appendPlainText(f"[ERROR] {e}")
 
-    def _read_output(self):
-        ansi_osc_escape = re.compile(
-            r'\x1B\][^\x07]*\x07'
-            r'|\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])'
-        )
-        if not self._proc:
-            return
-        prompt_pat = re.compile(r'^[\w\-.]+@[\w\-.]+[:].*[$#]\s*$')
-        banner_pat = re.compile(r'^(Welcome|Last login|Linux|Ubuntu|Authorized|Type "help"|Documentation|Support|Management|Expanded Security|Learn more|New release|\s*$)')
-        started = False
-        for line in iter(self._proc.stdout.readline, ''):
-            if not line:
-                break
-            clean_line = ansi_osc_escape.sub('', line).rstrip('\r\n')
-            if not started:
-                if clean_line.strip() == "" or banner_pat.match(clean_line) or prompt_pat.match(clean_line):
-                    continue
-                started = True
-            if prompt_pat.match(clean_line):
-                continue
-            QtCore.QMetaObject.invokeMethod(
-                self.output,
-                "appendPlainText",
-                QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(str, clean_line)
-            )
-        self._proc.wait()
-
-    def _exec_command(self):
-        if not self._proc or self._proc.poll() is not None:
-            return
-        cmd = self.cmd_edit.text().strip()
-        if not cmd:
-            return
-        try:
-            if not cmd.endswith("\n"):
-                cmd += "\n"
-            self._proc.stdin.write(cmd)
-            self._proc.stdin.flush()
-            self.cmd_edit.clear()
-        except Exception as e:
-            QtCore.QMetaObject.invokeMethod(
-                self.output,
-                "appendPlainText",
-                QtCore.Qt.QueuedConnection,
-                QtCore.Q_ARG(str, f"[ERROR] 指令送出失敗: {e}")
-            )
-
+    # ------------------------------------------------------------
+    # 中斷
+    # ------------------------------------------------------------
     def on_stop_clicked(self):
+        self._connected = False
         if self._proc:
             try:
                 self._proc.terminate()
             except:
                 pass
-        self._connected = False
-        self.output.appendPlainText("[SSH 連線結束]")
+            self._proc = None
+        self.output.appendPlainText("[!] 已中斷連線")
 
 class GobusterPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("Directory/File enumeration using gobuster dir")
+        self.desc.setText("列出目標網頁資料夾、文件...等")
 
         form = QtWidgets.QFormLayout()
 
