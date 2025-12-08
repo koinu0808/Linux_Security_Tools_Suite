@@ -19,6 +19,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 #              CONFIG & STYLES
 # ==========================================
 
+# [修改] 全域樣式表：將 QPlainTextEdit 統一改為黑底灰字
 APP_STYLESHEET = """
     QMenu {
         background-color: #F9F9F9;
@@ -70,11 +71,27 @@ APP_STYLESHEET = """
     QPushButton:disabled {
         background-color: #A0A0A0;
     }
-    QLineEdit, QComboBox, QPlainTextEdit {
+    /* 輸入框保持白底 */
+    QLineEdit, QComboBox, QCheckBox {
         background-color: white;
         border: 1px solid #D1D1D6;
         border-radius: 4px;
         padding: 4px 6px;
+        color: #1C1C1E;
+    }
+    QCheckBox {
+        background-color: transparent;
+        border: none;
+    }
+    /* [重點修改] 輸出框統一為黑底灰字 (Dark Mode) */
+    QPlainTextEdit {
+        background-color: #1e1e1e;
+        color: #d4d4d4;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 4px 6px;
+        selection-background-color: #264f78;
+        selection-color: white;
     }
     QLabel {
         font-weight: 400;
@@ -193,19 +210,7 @@ def build_powershell_command_str(cmd_list):
         return f"Get-Content -Raw -LiteralPath \"{q(path)}\""
         
     if exe == "whoami":
-        ps = (
-            "$u = whoami; "
-            "$os = (Get-CimInstance Win32_OperatingSystem); "
-            "$cpu = (Get-CimInstance Win32_Processor).Name; "
-            "$mem = [math]::Round($os.TotalVisibleMemorySize/1MB,2); "
-            "$ver = [System.Environment]::OSVersion.VersionString; "
-            "Write-Output ('使用者: ' + $u); "
-            "Write-Output ('作業系統: ' + $os.Caption); "
-            "Write-Output ('版本: ' + $ver); "
-            "Write-Output ('CPU: ' + $cpu); "
-            "Write-Output ('RAM: ' + $mem + ' GB');"
-        )
-        return ps
+        return "whoami"
         
     if exe == "ping":
         cnt = "4"
@@ -229,22 +234,10 @@ def build_powershell_command_str(cmd_list):
 def build_final_command(cmd_list, use_wsl=False):
     if use_wsl and is_windows():
         if cmd_list[0] == "whoami":
-            linux_cmd = (
-                "u=$(id -un 2>/dev/null | tr -d '\\r' | xargs); "
-                "if [ -z \"$u\" ]; then u=$(whoami | tr -d '\\r' | xargs); fi; "
-                "sys=$(uname -o | tr -d '\\r' | xargs); "
-                "ver=$(uname -r | tr -d '\\r' | xargs); "
-                "ker=$(uname -s | tr -d '\\r' | xargs); "
-                "cpu=$(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs); "
-                "ram=$(free -h | awk '/Mem:/ {print $2}' | tr -d '\\r' | xargs); "
-                "printf '使用者: %s\\n系統: %s\\n版本: %s\\n核心: %s\\nCPU: %s\\nRAM: %s\\n' "
-                "\"$u\" \"$sys\" \"$ver\" \"$ker\" \"$cpu\" \"$ram\"; "
-                "exit 0"
-            )
-            return ['wsl', 'bash', '-c', linux_cmd]
+            return ['wsl', 'whoami']
     elif is_windows() and not use_wsl:
         exe = cmd_list[0].lower()
-        external = {"nmap", "ncat", "nc", "hydra", "john", "hashid", "tcpdump"}
+        external = {"nmap", "ncat", "nc", "hydra", "john", "hashid", "tcpdump", "whatweb"}
         if exe in external and command_exists(exe):
             return cmd_list
         ps = build_powershell_command_str(cmd_list)
@@ -253,10 +246,9 @@ def build_final_command(cmd_list, use_wsl=False):
 
 class AnsiConverter:
     """ ANSI 轉 HTML 處理器 """
-    
     def __init__(self):
         self.COLORS = {
-            '30': 'black', '31': '#d9534f', '32': '#2ea84a', '33': '#f0ad4e',
+            '30': '#888888', '31': '#d9534f', '32': '#2ea84a', '33': '#f0ad4e',
             '34': '#007aff', '35': '#9b59b6', '36': '#5bc0de', '37': '#d4d4d4',
             '90': 'gray', '91': '#ff6b6b', '92': '#51cf66', '93': '#fcc419',
             '94': '#339af0', '95': '#cc5de8', '96': '#66d9e8', '97': 'white',
@@ -267,46 +259,34 @@ class AnsiConverter:
         }
 
     def convert(self, text):
-        # 1. 移除 Shell 垃圾訊號
         text = re.sub(r'\x1b\[\?2004[hl]', '', text)
         text = re.sub(r'\x1b\[\?1[hl]', '', text)
         text = re.sub(r'\x1b\]0;.*?\x07', '', text)
-
-        # 2. HTML Escape
         text = html.escape(text)
 
-        # 3. 處理 ANSI 顏色碼
         def ansi_sub(match):
             code = match.group(1)
             if code == '0' or code == '00':
                 return '</span>'
-            
             parts = code.split(';')
             style = []
             fg_color = None
             is_bold = False
-
             for part in parts:
                 if part == '1' or part == '01':
                     is_bold = True
                     style.append('font-weight:bold')
                 elif part in self.COLORS:
                     fg_color = part
-
             if fg_color:
                 c_hex = self.BOLD_COLORS.get(fg_color) if is_bold else self.COLORS.get(fg_color)
                 style.append(f'color:{c_hex}')
-            
             if style:
                 return f'<span style="{";".join(style)}">'
             return ''
 
         text = re.sub(r'\x1b\[([0-9;]*)m', ansi_sub, text)
-        
-        # 4. 移除其他無法處理的 ANSI 控制碼
         text = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', text)
-        
-        # [修正] 這裡不再將 \n 轉為 <br>，交給 SshPage 處理物理換行
         return text
 
 # ==========================================
@@ -473,7 +453,7 @@ class ToolPageBase(QtWidgets.QWidget):
         
         if is_windows() and not use_wsl:
             exe = cmd_list[0].lower() if isinstance(cmd_list, list) else cmd_list.split()[0].lower()
-            if exe in {"nmap", "hydra", "john", "tcpdump", "hashid", "ncat", "nc", "gobuster"} and not command_exists(exe):
+            if exe in {"nmap", "hydra", "john", "tcpdump", "hashid", "ncat", "nc", "gobuster", "whatweb"} and not command_exists(exe):
                 self.output.appendPlainText(f"[WARN] 系統找不到 {exe}；請安裝或改勾 WSL")
                 
         self.progress.setVisible(True)
@@ -516,16 +496,122 @@ class ToolPageBase(QtWidgets.QWidget):
 #              TOOL PAGES
 # ==========================================
 
-class WhoamiPage(ToolPageBase):
+# ==========================================
+# [新增] 1. WhatWebPage - 取代原本的 WhoamiPage
+# ==========================================
+class WhatWebPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("顯示目前電腦系統資訊")
-        self.target_label.hide()
-        self.target_edit.hide()
-        self.options_scroll.hide()
+        self.desc.setText("目標裝置識別、識別 CMS、伺服器類型、IP 與網頁指紋。")
+        self.target_edit.setPlaceholderText("輸入 Domain 或 IP (例如: example.com)")
         
+        # 只有一個詳細模式勾選框
+        self.verbose_ck = QtWidgets.QCheckBox("詳細輸出")
+        self.options_layout.addWidget(self.verbose_ck)
+
     def on_start_clicked(self):
-        self.start_worker(["whoami"])
+        target = self.target_edit.text().strip()
+        if not target:
+            self.output.appendPlainText("[ERROR] 請輸入 Target")
+            return
+
+        # 使用 --color=never 以便手動進行美觀排版
+        cmd = ["wsl","whatweb", "--color=never", target]
+        if self.verbose_ck.isChecked():
+            cmd.insert(1, "-v")
+            
+        self.start_worker_custom(cmd)
+
+    # 覆寫 start_worker 以連接自定義的輸出處理函數
+    def start_worker_custom(self, cmd_list):
+        mw = self.main_window()
+        if not mw: return
+        
+        use_wsl = self.use_wsl_ck.isChecked()
+        mw.set_encoding_based_on_wsl(use_wsl)
+        encoding = mw.encoding_combo.currentText()
+        
+        self.output.clear()
+        # [START] 顏色保持原樣 (由 QPlainTextEdit 預設文字顏色決定)
+        self.output.appendPlainText(f"[START]\n") 
+        
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0) # Indeterminate mode
+        
+        self.worker = CmdWorker(cmd_list, encoding=encoding, use_wsl=use_wsl)
+        self.thread = QtCore.QThread()
+        self.worker.moveToThread(self.thread)
+        
+        # [關鍵] 連接到自定義排版函數
+        self.worker.output_line.connect(self.parse_output)
+        
+        self.worker.finished.connect(self._on_finished)
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+        
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    def parse_output(self, line):
+        # 過濾 Ruby 警告訊息
+        if "warning:" in line or "URI.escape" in line:
+            return
+
+        if self.verbose_ck.isChecked():
+            self.output.appendPlainText(line)
+            return
+
+        line = line.strip()
+        if not line: return
+
+        # 解析標準輸出
+        # 格式: http://xxx [200 OK] Tag[Val], Tag[Val]...
+        try:
+            if not line.startswith("http") and not line[0].isdigit():
+                self.output.appendPlainText(line)
+                return
+
+            import re
+            m = re.match(r'^(\S+) \[(.*?)\] (.*)$', line)
+            if m:
+                url = m.group(1)
+                status = m.group(2)
+                tags_raw = m.group(3)
+                
+                # Status 顏色
+                st_color = "#28CD41" # Green
+                if not status.startswith("2"): st_color = "#FF3B30" # Red
+                if status.startswith("3"): st_color = "#FF9500" # Orange
+
+                # URL (Blue) & Status (Color)
+                html = f'<span style="color:#007AFF; font-weight:bold;">{url}</span> '
+                html += f'<span style="color:{st_color};">[{status}]</span><br>'
+                
+                # Tags 處理：每個標題換行
+                # Tags 格式: Name[Value], Name[Value]
+                # 用 replace '], ' -> ']|' 然後 split '|' 來分割
+                tags_str = tags_raw.replace('], ', ']|')
+                tags = tags_str.split('|')
+                
+                for t in tags:
+                    t = t.strip()
+                    # 分離 Name 和 Value
+                    if '[' in t and t.endswith(']'):
+                        p = t.find('[')
+                        name = t[:p]
+                        val = t[p+1:-1]
+                        # 排版: 縮進 + Name(灰) + Value(白)
+                        html += f'&nbsp;&nbsp;<span style="color:#AAAAAA;">{name}:</span> <span style="color:#FFFFFF;">{val}</span><br>'
+                    else:
+                        html += f'&nbsp;&nbsp;{t}<br>'
+                        
+                html += "<br>" # 加個空行分隔
+                self.output.appendHtml(html)
+            else:
+                self.output.appendPlainText(line)
+
+        except:
+            self.output.appendPlainText(line)
 
 class LsPage(ToolPageBase):
     def __init__(self, parent=None):
@@ -1289,11 +1375,11 @@ class HydraPage(ToolPageBase):
             else:
                 proto = svc
                 
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} {proto} \"{form}\""]
+            cmd = ["hydra"] + user_arg + pass_arg + ["-I","-t", threads, f"{tgt} {proto} \"{form}\""]
         elif svc == "ssh":
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} ssh"]
+            cmd = ["hydra"] + user_arg + pass_arg + ["-I","-t", threads, f"{tgt} ssh"]
         elif svc == "ftp":
-            cmd = ["hydra"] + user_arg + pass_arg + ["-t", threads, f"{tgt} ftp"]
+            cmd = ["hydra"] + user_arg + pass_arg + ["-I","-t", threads, f"{tgt} ftp"]
             
         if use_wsl:
             cmd = ["wsl"] + cmd
@@ -1357,17 +1443,8 @@ class SshPage(ToolPageBase):
 
         self.options_layout.addLayout(form)
 
-        # Output Styles
+        # [修正] 移除這裡的 setStyleSheet，改用全域設定，解決縮放問題
         self.output.setReadOnly(True)
-        self.output.setFont(QtGui.QFont("Consolas", 11))
-        self.output.setStyleSheet("""
-            QPlainTextEdit {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                selection-background-color: #264f78;
-                line-height: 1.2;
-            }
-        """)
 
         # Command Input
         self.input = QtWidgets.QLineEdit()
@@ -1397,28 +1474,19 @@ class SshPage(ToolPageBase):
             key = event.key()
             mod = event.modifiers()
 
-            # =========================================================
-            # [新增] 智慧 Ctrl+C 處理
-            # =========================================================
+            # Ctrl+C 處理
             if key == QtCore.Qt.Key_C and (mod & QtCore.Qt.ControlModifier):
-                # 情況 1: 如果你在輸入框裡「選取了文字」
-                # -> 我們什麼都不做 (return False)，讓系統執行預設的「複製」動作
                 if self.input.hasSelectedText():
                     return False
-                
-                # 情況 2: 如果沒有選字 -> 發送 SIGINT (中斷訊號) 給 SSH
                 if self._connected and self._proc:
                     try:
-                        # 發送 ASCII \x03 (End of Text)，這就是終端機裡的 Ctrl+C
                         self._proc.stdin.write(b'\x03')
                         self._proc.stdin.flush()
                     except Exception:
                         pass
-                    return True # 攔截事件，避免在輸入框打出奇怪的字元
+                    return True 
 
-            # =========================================================
-            # 原本的歷史紀錄功能 (保持不變)
-            # =========================================================
+            # 歷史紀錄
             if key == QtCore.Qt.Key_Up:
                 self._history_prev()
                 return True
@@ -1501,17 +1569,12 @@ class SshPage(ToolPageBase):
         raw_text = raw_text.replace('\r\n', '\n')
 
         # 2. [關鍵邏輯] 使用正則表達式分割 \n 與 \r
-        # 這樣我們可以精準控制何時「換段落」何時「刪除行」
         parts = re.split(r'(\n|\r)', raw_text)
 
         for part in parts:
             if part == '\n':
-                # 遇到換行：插入真正的 "Block" (段落)
-                # 這樣之前的內容就安全了，不會被 StartOfBlock 刪除
                 cursor.insertBlock()
             elif part == '\r':
-                # 遇到回車：回到當前 Block 的開頭並刪除
-                # 因為前面已經用 insertBlock 保護了歷史紀錄，這裡只會刪到當前行
                 cursor.movePosition(QtGui.QTextCursor.StartOfBlock, QtGui.QTextCursor.KeepAnchor)
                 cursor.removeSelectedText()
             else:
@@ -1583,13 +1646,10 @@ class SshPage(ToolPageBase):
 # ==========================================
 #       GOBUSTER 專用 ANSI 轉換器
 # ==========================================
-# ==========================================
-#       GOBUSTER 專用 ANSI 轉換器
-# ==========================================
 class GobusterAnsiConverter:
     def __init__(self):
         self.fg_colors = {
-            '30': 'black', '31': '#d9534f', '32': '#2ea84a', '33': '#f0ad4e',
+            '30': '#888888', '31': '#d9534f', '32': '#2ea84a', '33': '#f0ad4e',
             '34': '#007aff', '35': '#9b59b6', '36': '#5bc0de', '37': '#d4d4d4',
             '90': 'gray', '91': '#ff6b6b', '92': '#51cf66', '93': '#fcc419',
             '94': '#339af0', '95': '#cc5de8', '96': '#66d9e8', '97': 'white',
@@ -1616,10 +1676,7 @@ class GobusterAnsiConverter:
         return text
 
 # ==========================================
-#              GOBUSTER PAGE (完美 CMD 版)
-# ==========================================
-# ==========================================
-#              GOBUSTER PAGE (完美 CMD 版)
+#              GOBUSTER PAGE
 # ==========================================
 class GobusterPage(ToolPageBase):
     def __init__(self, parent=None):
@@ -1670,17 +1727,7 @@ class GobusterPage(ToolPageBase):
 
         self.options_layout.addLayout(form)
 
-        # [樣式還原] 使用 SSH Page 的深灰色風格
-        self.output.setStyleSheet("""
-            QPlainTextEdit {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                font-family: Consolas, "Courier New", monospace;
-                font-size: 10pt;
-                border: 1px solid #333;
-            }
-        """)
-
+        # [修正] 移除 setStyleSheet，使用全域黑框設定，修復縮放
         self.wordlist_btn.clicked.connect(self._browse_wordlist)
         self.output_btn.clicked.connect(self._browse_output)
 
@@ -1888,8 +1935,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.setMouseTracking(True)
         self.nav.setFont(QtGui.QFont("Segoe UI", 10))
         
+        # [修改] 1. 更新第一項工具名稱
         tools = [
-            "顯示當前裝置資訊", "檔案列表", "查看文件內容", "IP狀態查詢", "傳輸測試",
+            "顯示目標裝置資訊", "檔案列表", "查看文件內容", "IP狀態查詢", "傳輸測試",
             "埠口掃描", "路由追蹤", "DNS查詢", "網頁原始碼擷取", "弱密碼測試", "SSH連線", "列出網頁文件"
         ]
         
@@ -1903,8 +1951,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         main_layout.addWidget(self.stack, 1)
         
+        # [修改] 2. 將第一項對應到 WhatWebPage
         clsmap = {
-            "顯示當前裝置資訊": WhoamiPage,
+            "顯示目標裝置資訊": WhatWebPage,
             "檔案列表": LsPage,
             "查看文件內容": CatPage,
             "IP狀態查詢": PingPage,
@@ -1954,16 +2003,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wsl_timer.timeout.connect(self._update_wsl_status)
         self.wsl_timer.start()
         
-        # Menu
+        # ==========================================
+        # [NEW] Menu & Font Control
+        # ==========================================
         menubar = self.menuBar()
-        env_menu = menubar.addMenu("Env")
-        ac = QtWidgets.QAction("Check WSL Now", self)
+        
+        # Env Menu
+        env_menu = menubar.addMenu("環境 (Env)")
+        ac = QtWidgets.QAction("立即檢查 WSL", self)
         ac.triggered.connect(lambda: self._update_wsl_status(force=True))
         env_menu.addAction(ac)
+
+        # View Menu (字體控制)
+        view_menu = menubar.addMenu("檢視 (View)")
         
+        font_act = QtWidgets.QAction("設定字型與大小 (Font Settings)", self)
+        font_act.setShortcut("Ctrl+F") # 快捷鍵 Ctrl+F
+        font_act.triggered.connect(self.open_font_dialog)
+        view_menu.addAction(font_act)
+        
+        view_menu.addSeparator()
+
+        zoom_in_act = QtWidgets.QAction("放大 (Zoom In)", self)
+        zoom_in_act.setShortcut("Ctrl+=") # 快捷鍵 Ctrl + =
+        zoom_in_act.triggered.connect(lambda: self.change_zoom(1))
+        view_menu.addAction(zoom_in_act)
+
+        zoom_out_act = QtWidgets.QAction("縮小 (Zoom Out)", self)
+        zoom_out_act.setShortcut("Ctrl+-") # 快捷鍵 Ctrl + -
+        zoom_out_act.triggered.connect(lambda: self.change_zoom(-1))
+        view_menu.addAction(zoom_out_act)
+
         # Events
         self.encoding_combo.currentTextChanged.connect(lambda t: self.status.showMessage(f"編碼: {t}", 1500))
         self.nav.currentRowChanged.connect(self._sync_encoding_on_page_change)
+
+    # ==========================================
+    # [NEW] Font Logic
+    # ==========================================
+    def open_font_dialog(self):
+        # 取得當前第一頁的字體作為預設值
+        current_font = list(self.pages.values())[0].output.font()
+        font, ok = QtWidgets.QFontDialog.getFont(current_font, self, "選擇輸出區字體")
+        if ok:
+            # 將字體套用到所有頁面的 output 區塊
+            for page in self.pages.values():
+                if hasattr(page, 'output'):
+                    page.output.setFont(font)
+            self.status.showMessage(f"字體已更新: {font.family()} {font.pointSize()}pt", 3000)
+
+    def change_zoom(self, delta):
+        # delta 為正數放大，負數縮小
+        for page in self.pages.values():
+            if hasattr(page, 'output'):
+                if delta > 0:
+                    page.output.zoomIn(1)
+                else:
+                    page.output.zoomOut(1)
+        action = "放大" if delta > 0 else "縮小"
+        self.status.showMessage(f"已{action}顯示比例", 1000)
 
     def set_encoding_based_on_wsl(self, use_wsl: bool, initial=False):
         if use_wsl:
