@@ -10,6 +10,7 @@ import ipaddress
 import socket
 import difflib
 import html
+import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -19,7 +20,6 @@ from PyQt5.QtCore import QThread, pyqtSignal
 #              CONFIG & STYLES
 # ==========================================
 
-# [修改] 全域樣式表：將 QPlainTextEdit 統一改為黑底灰字
 APP_STYLESHEET = """
     QMenu {
         background-color: #F9F9F9;
@@ -71,7 +71,6 @@ APP_STYLESHEET = """
     QPushButton:disabled {
         background-color: #A0A0A0;
     }
-    /* 輸入框保持白底 */
     QLineEdit, QComboBox, QCheckBox {
         background-color: white;
         border: 1px solid #D1D1D6;
@@ -83,7 +82,6 @@ APP_STYLESHEET = """
         background-color: transparent;
         border: none;
     }
-    /* [重點修改] 輸出框統一為黑底灰字 (Dark Mode) */
     QPlainTextEdit {
         background-color: #1e1e1e;
         color: #d4d4d4;
@@ -108,19 +106,18 @@ APP_STYLESHEET = """
     QProgressBar::chunk {
         background-color: #007AFF;
     }
-    /* Scrollbar styling */
     QScrollBar:vertical {
         border: none;
         background: transparent;
         width: 8px;
         margin: 0px;
     }
-    QScrollBar::handle:vertical {
+    QScrollBar:handle:vertical {
         background: #C6C6C8;
         border-radius: 4px;
         min-height: 20px;
     }
-    QScrollBar::handle:vertical:hover {
+    QScrollBar:handle:vertical:hover {
         background: #A0A0A0;
     }
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -141,7 +138,6 @@ APP_STYLESHEET = """
     QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 """
 
-# Windows 下隱藏 subprocess 視窗的 hack
 if sys.platform.startswith("win"):
     _orig_popen = subprocess.Popen
 
@@ -237,7 +233,7 @@ def build_final_command(cmd_list, use_wsl=False):
             return ['wsl', 'whoami']
     elif is_windows() and not use_wsl:
         exe = cmd_list[0].lower()
-        external = {"nmap", "ncat", "nc", "hydra", "john", "hashid", "tcpdump", "whatweb"}
+        external = {"nmap", "ncat", "nc", "hydra", "john", "hashid", "tcpdump", "whatweb", "gobuster"}
         if exe in external and command_exists(exe):
             return cmd_list
         ps = build_powershell_command_str(cmd_list)
@@ -245,7 +241,6 @@ def build_final_command(cmd_list, use_wsl=False):
     return cmd_list
 
 class AnsiConverter:
-    """ ANSI 轉 HTML 處理器 """
     def __init__(self):
         self.COLORS = {
             '30': '#888888', '31': '#d9534f', '32': '#2ea84a', '33': '#f0ad4e',
@@ -262,11 +257,13 @@ class AnsiConverter:
         text = re.sub(r'\x1b\[\?2004[hl]', '', text)
         text = re.sub(r'\x1b\[\?1[hl]', '', text)
         text = re.sub(r'\x1b\]0;.*?\x07', '', text)
+        text = re.sub(r'\x1b\[2K', '', text)
+        
         text = html.escape(text)
 
         def ansi_sub(match):
             code = match.group(1)
-            if code == '0' or code == '00':
+            if not code or code == '0' or code == '00':
                 return '</span>'
             parts = code.split(';')
             style = []
@@ -298,11 +295,12 @@ class CmdWorker(QtCore.QObject):
     finished = QtCore.pyqtSignal()
     started = QtCore.pyqtSignal()
 
-    def __init__(self, cmd_list, encoding="utf-8", use_wsl=False):
+    def __init__(self, cmd_list, encoding="utf-8", use_wsl=False, raw_mode=False):
         super().__init__()
         self.cmd_list = cmd_list
         self.encoding = encoding
         self.use_wsl = use_wsl
+        self.raw_mode = raw_mode
         self._proc = None
         self._stop = False
 
@@ -310,11 +308,12 @@ class CmdWorker(QtCore.QObject):
     def run(self):
         self.started.emit()
         try:
-            full_cmd = build_final_command(self.cmd_list, use_wsl=self.use_wsl)
+            if self.raw_mode:
+                full_cmd = self.cmd_list
+            else:
+                full_cmd = build_final_command(self.cmd_list, use_wsl=self.use_wsl)
+            
             print("最終命令：", full_cmd)
-
-            if isinstance(full_cmd, list):
-                full_cmd = ' '.join(full_cmd)
 
             self._proc = subprocess.Popen(
                 full_cmd, 
@@ -356,6 +355,244 @@ class CmdWorker(QtCore.QObject):
             pass
 
 # ==========================================
+#              REPORT WORKER
+# ==========================================
+class ReportWorker(QtCore.QObject):
+    log_message = QtCore.pyqtSignal(str) 
+    stream_output = QtCore.pyqtSignal(str) 
+    finished = QtCore.pyqtSignal(str)
+
+    def __init__(self, target, encoding="utf-8"):
+        super().__init__()
+        self.target = target
+        self.use_wsl = True 
+        self.encoding = encoding
+        self._stop = False
+        self.ansi_converter = AnsiConverter()
+        
+        self.tasks = [
+            ("Connectivity (Ping)", ["ping", "-c", "4", "{DOMAIN}"]),
+            ("Route Analysis (Traceroute)", ["tracert", "{DOMAIN}"]),
+            ("Web Tech (WhatWeb)", ["whatweb", "--color=never", "{DOMAIN}"]),
+            ("DNS Records (Dig)", ["dig", "{DOMAIN}"]),
+            ("Port Scan (Nmap Fast)", ["nmap", "-F", "{DOMAIN}"]),
+            ("HTTP Headers (Curl HEAD)", ["curl", "-I", "-s", "{URL}"]),
+            ("SSL Certificate", ["bash", "-c", "echo | openssl s_client -showcerts -servername {DOMAIN} -connect {DOMAIN}:443 2>/dev/null | openssl x509 -inform pem -noout -text"]),
+            ("Directory Scan (Gobuster)", ["gobuster", "-u", "{URL}", "-w", "/usr/share/wordlists/dirb/common.txt", "-t", "20"])
+        ]
+
+    def _format_gobuster_html(self, raw_text):
+        lines = raw_text.splitlines()
+        formatted_html = ""
+        
+        COLOR_2XX = "#2ea84a"
+        COLOR_3XX = "#f0ad4e"
+        COLOR_4XX = "#d9534f"
+        COLOR_DEF = "#cccccc"
+
+        import re
+
+        for line in lines:
+            line = line.replace('\x1b[2K', '').strip()
+            
+            if not line: continue
+            if "Progress:" in line: continue
+            if line.startswith("=") or line.startswith("[+]"): continue
+            if "Gobuster" in line or "Starting" in line or "Finished" in line: continue
+
+            match = re.search(r"(\S+)\s+\(Status:\s+(\d+)\)", line)
+            
+            if match:
+                path = match.group(1)
+                code = match.group(2)
+                
+                color = COLOR_DEF
+                if code.startswith("2"): color = COLOR_2XX
+                elif code.startswith("3"): color = COLOR_3XX
+                elif code.startswith("4") or code.startswith("5"): color = COLOR_4XX
+                
+                row_html = f'<div><span style="color:#ffffff; font-weight:bold;">{path}</span> <span style="color:{color}">(Status: {code})</span></div>'
+                formatted_html += row_html
+                
+        return formatted_html
+
+    def _format_whatweb_html(self, raw_text):
+        lines = raw_text.splitlines()
+        formatted_html = ""
+        import re
+
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            if "warning:" in line or "URI.escape" in line: continue
+
+            m = re.match(r'^(\S+) \[(.*?)\] (.*)$', line)
+            if m:
+                url = m.group(1)
+                status = m.group(2)
+                tags_raw = m.group(3)
+                
+                st_color = "#FF3B30"
+                if status.startswith("2"): st_color = "#28CD41"
+                elif status.startswith("3"): st_color = "#FF9500"
+
+                row_html = f'<div style="margin-bottom: 10px; border-bottom: 1px solid #333; padding-bottom: 5px;">'
+                row_html += f'<span style="color:#61afef; font-weight:bold; font-size: 1.1em;">{url}</span> '
+                row_html += f'<span style="color:{st_color}; font-weight:bold;">[{status}]</span><br>'
+                
+                tags_str = tags_raw.replace('], ', ']|')
+                tags = tags_str.split('|')
+                
+                for t in tags:
+                    t = t.strip()
+                    if '[' in t and t.endswith(']'):
+                        p = t.find('[')
+                        name = t[:p]
+                        val = t[p+1:-1]
+                        row_html += f'<div style="margin-left: 20px;"><span style="color:#aaaaaa;">{name}:</span> <span style="color:#d4d4d4;">{val}</span></div>'
+                    else:
+                        row_html += f'<div style="margin-left: 20px; color:#d4d4d4;">{t}</div>'
+                
+                row_html += '</div>'
+                formatted_html += row_html
+            else:
+                formatted_html += f'<div style="color:#cccccc;">{line}</div>'
+        
+        return formatted_html
+
+    def _execute_task(self, title, cmd_template, clean_domain, full_url):
+        if self._stop: return title, ""
+        
+        cmd = []
+        for x in cmd_template:
+            val = x.replace("{DOMAIN}", clean_domain)
+            val = val.replace("{URL}", full_url)
+            cmd.append(val)
+        
+        use_wsl_for_this = True
+        current_encoding = "utf-8"
+        
+        if cmd[0] == "tracert":
+            use_wsl_for_this = False
+            current_encoding = "cp950"
+        elif cmd[0] != "wsl":
+            cmd = ["wsl"] + cmd
+            
+        raw_output_buffer = ""
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding=current_encoding,
+                errors="replace",
+                bufsize=1,
+                creationflags=subprocess.CREATE_NO_WINDOW if is_windows() else 0
+            )
+            
+            for line in proc.stdout:
+                if self._stop:
+                    proc.terminate()
+                    break
+                raw_output_buffer += line
+            
+            proc.wait()
+            
+        except Exception as e:
+            raw_output_buffer += f"[!] Error executing task {title}: {e}\n"
+
+        if "Gobuster" in title:
+            formatted_output = self._format_gobuster_html(raw_output_buffer)
+        elif "WhatWeb" in title:
+            formatted_output = self._format_whatweb_html(raw_output_buffer)
+        else:
+            formatted_output = self.ansi_converter.convert(raw_output_buffer)
+            
+        return title, formatted_output
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        self.stream_output.emit("[START]\n")
+        
+        clean_domain = self.target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
+        if self.target.lower().startswith("http"):
+            full_url = self.target
+        else:
+            full_url = f"http://{self.target}"
+
+        report_style = """
+        <style>
+            body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Consolas', 'Fira Code', monospace; padding: 20px; max-width: 1200px; margin: 0 auto; }
+            h1 { color: #61afef; border-bottom: 2px solid #3e4451; padding-bottom: 10px; }
+            .meta { color: #888; font-size: 0.9em; margin-bottom: 30px; }
+            .tool-card { background: #252526; border: 1px solid #333; margin-bottom: 20px; border-radius: 6px; overflow: hidden; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+            .tool-header { background: #333333; padding: 10px 15px; font-weight: bold; color: #e5c07b; border-bottom: 1px solid #2b2b2b; display: flex; justify-content: space-between; align-items: center; }
+            .tool-output { padding: 15px; white-space: pre-wrap; font-size: 13px; line-height: 1.4; background-color: #1e1e1e; overflow-x: auto; color: #cccccc; margin: 0; }
+            .status-dot { height: 10px; width: 10px; background-color: #98c379; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        </style>
+        """
+
+        html_content = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Security Report - {clean_domain}</title>
+            {report_style}
+        </head>
+        <body>
+            <h1>Security Assessment Report</h1>
+            <div class="meta">
+                Target: <strong>{clean_domain}</strong><br>
+                Date: {datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}<br>
+                Generated by: Linux Security Tools Suite
+            </div>
+        """
+
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=len(self.tasks)) as executor:
+            future_to_title = {}
+            
+            for title, cmd_template in self.tasks:
+                self.stream_output.emit(f"[*] START {title} ..\n")
+                future = executor.submit(self._execute_task, title, cmd_template, clean_domain, full_url)
+                future_to_title[future] = title
+            
+            self.stream_output.emit("\n") 
+
+            for future in as_completed(future_to_title):
+                title, output = future.result()
+                results[title] = output
+                self.stream_output.emit(f"[+] {title} Complete ...\n")
+
+        for title, _ in self.tasks:
+            formatted_output = results.get(title, "")
+            html_content += f"""
+            <div class="tool-card">
+                <div class="tool-header">
+                    <span><span class="status-dot"></span>{title}</span>
+                </div>
+                <div class="tool-output">{formatted_output}</div> 
+            </div>
+            """
+
+        html_content += "</body></html>"
+
+        filename = f"Report_{clean_domain.replace('.', '_')}_{int(time.time())}.html"
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            self.finished.emit(filename)
+        except Exception as e:
+            self.stream_output.emit(f"\n[ERROR] Failed to save report: {e}\n")
+            self.finished.emit("")
+
+    def stop(self):
+        self._stop = True
+
+# ==========================================
 #              BASE PAGE CLASS
 # ==========================================
 
@@ -393,6 +630,10 @@ class ToolPageBase(QtWidgets.QWidget):
 
         right_layout = QtWidgets.QVBoxLayout()
         self.use_wsl_ck = QtWidgets.QCheckBox("使用 WSL 執行 (Windows)")
+        
+        # [修改] 預設勾選 WSL
+        self.use_wsl_ck.setChecked(True)
+        
         right_layout.addWidget(self.use_wsl_ck, 0, QtCore.Qt.AlignTop)
         right_layout.addStretch()
         top_layout.addLayout(right_layout)
@@ -438,7 +679,7 @@ class ToolPageBase(QtWidgets.QWidget):
         self.start_btn.clicked.connect(self.on_start_clicked)
         self.stop_btn.clicked.connect(self.on_stop_clicked)
 
-    def start_worker(self, cmd_list):
+    def start_worker(self, cmd_list, raw_mode=False):
         mw = self.main_window()
         if not mw:
             self.output.appendPlainText("[ERROR] 找不到主視窗")
@@ -451,7 +692,7 @@ class ToolPageBase(QtWidgets.QWidget):
         self.output.clear()
         self.output.appendPlainText(f"[START]\n")
         
-        if is_windows() and not use_wsl:
+        if is_windows() and not use_wsl and not raw_mode:
             exe = cmd_list[0].lower() if isinstance(cmd_list, list) else cmd_list.split()[0].lower()
             if exe in {"nmap", "hydra", "john", "tcpdump", "hashid", "ncat", "nc", "gobuster", "whatweb"} and not command_exists(exe):
                 self.output.appendPlainText(f"[WARN] 系統找不到 {exe}；請安裝或改勾 WSL")
@@ -460,7 +701,7 @@ class ToolPageBase(QtWidgets.QWidget):
         self.progress.setRange(0, 100)
         self.progress.setValue(50)
         
-        self.worker = CmdWorker(cmd_list, encoding=encoding, use_wsl=use_wsl)
+        self.worker = CmdWorker(cmd_list, encoding=encoding, use_wsl=use_wsl, raw_mode=raw_mode)
         self.thread = QtCore.QThread()
         self.worker.moveToThread(self.thread)
         self.worker.output_line.connect(self.output.appendPlainText)
@@ -496,18 +737,11 @@ class ToolPageBase(QtWidgets.QWidget):
 #              TOOL PAGES
 # ==========================================
 
-# ==========================================
-# [新增] 1. WhatWebPage - 取代原本的 WhoamiPage
-# ==========================================
 class WhatWebPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.desc.setText("目標裝置識別、識別 CMS、伺服器類型、IP 與網頁指紋。")
         self.target_edit.setPlaceholderText("輸入 Domain 或 IP (例如: example.com)")
-        
-        # 只有一個詳細模式勾選框
-        self.verbose_ck = QtWidgets.QCheckBox("詳細輸出")
-        self.options_layout.addWidget(self.verbose_ck)
 
     def on_start_clicked(self):
         target = self.target_edit.text().strip()
@@ -515,14 +749,10 @@ class WhatWebPage(ToolPageBase):
             self.output.appendPlainText("[ERROR] 請輸入 Target")
             return
 
-        # 使用 --color=never 以便手動進行美觀排版
         cmd = ["wsl","whatweb", "--color=never", target]
-        if self.verbose_ck.isChecked():
-            cmd.insert(1, "-v")
             
         self.start_worker_custom(cmd)
 
-    # 覆寫 start_worker 以連接自定義的輸出處理函數
     def start_worker_custom(self, cmd_list):
         mw = self.main_window()
         if not mw: return
@@ -532,17 +762,15 @@ class WhatWebPage(ToolPageBase):
         encoding = mw.encoding_combo.currentText()
         
         self.output.clear()
-        # [START] 顏色保持原樣 (由 QPlainTextEdit 預設文字顏色決定)
         self.output.appendPlainText(f"[START]\n") 
         
         self.progress.setVisible(True)
-        self.progress.setRange(0, 0) # Indeterminate mode
+        self.progress.setRange(0, 0)
         
         self.worker = CmdWorker(cmd_list, encoding=encoding, use_wsl=use_wsl)
         self.thread = QtCore.QThread()
         self.worker.moveToThread(self.thread)
         
-        # [關鍵] 連接到自定義排版函數
         self.worker.output_line.connect(self.parse_output)
         
         self.worker.finished.connect(self._on_finished)
@@ -553,19 +781,12 @@ class WhatWebPage(ToolPageBase):
         self.stop_btn.setEnabled(True)
 
     def parse_output(self, line):
-        # 過濾 Ruby 警告訊息
         if "warning:" in line or "URI.escape" in line:
-            return
-
-        if self.verbose_ck.isChecked():
-            self.output.appendPlainText(line)
             return
 
         line = line.strip()
         if not line: return
 
-        # 解析標準輸出
-        # 格式: http://xxx [200 OK] Tag[Val], Tag[Val]...
         try:
             if not line.startswith("http") and not line[0].isdigit():
                 self.output.appendPlainText(line)
@@ -578,40 +799,73 @@ class WhatWebPage(ToolPageBase):
                 status = m.group(2)
                 tags_raw = m.group(3)
                 
-                # Status 顏色
-                st_color = "#28CD41" # Green
-                if not status.startswith("2"): st_color = "#FF3B30" # Red
-                if status.startswith("3"): st_color = "#FF9500" # Orange
+                st_color = "#28CD41" 
+                if not status.startswith("2"): st_color = "#FF3B30"
+                if status.startswith("3"): st_color = "#FF9500"
 
-                # URL (Blue) & Status (Color)
                 html = f'<span style="color:#007AFF; font-weight:bold;">{url}</span> '
                 html += f'<span style="color:{st_color};">[{status}]</span><br>'
                 
-                # Tags 處理：每個標題換行
-                # Tags 格式: Name[Value], Name[Value]
-                # 用 replace '], ' -> ']|' 然後 split '|' 來分割
                 tags_str = tags_raw.replace('], ', ']|')
                 tags = tags_str.split('|')
                 
                 for t in tags:
                     t = t.strip()
-                    # 分離 Name 和 Value
                     if '[' in t and t.endswith(']'):
                         p = t.find('[')
                         name = t[:p]
                         val = t[p+1:-1]
-                        # 排版: 縮進 + Name(灰) + Value(白)
                         html += f'&nbsp;&nbsp;<span style="color:#AAAAAA;">{name}:</span> <span style="color:#FFFFFF;">{val}</span><br>'
                     else:
                         html += f'&nbsp;&nbsp;{t}<br>'
                         
-                html += "<br>" # 加個空行分隔
+                html += "<br>"
                 self.output.appendHtml(html)
             else:
                 self.output.appendPlainText(line)
 
         except:
             self.output.appendPlainText(line)
+
+class SslCertPage(ToolPageBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.desc.setText("SSL/TLS 憑證檢查。")
+        self.target_edit.setPlaceholderText("Domain (e.g. google.com)")
+        
+        # [修改] 使用水平佈局將 Port 標籤與輸入框放在同一行
+        h_layout = QtWidgets.QHBoxLayout()
+        h_layout.setContentsMargins(0, 0, 0, 0) # 去除邊距讓它貼齊
+        
+        label = QtWidgets.QLabel("Port:")
+        h_layout.addWidget(label)
+        
+        self.port_edit = QtWidgets.QLineEdit("443")
+        self.port_edit.setFixedWidth(80) # 固定寬度，比較整潔
+        h_layout.addWidget(self.port_edit)
+        
+        h_layout.addStretch() # 讓元件靠左，後面留白
+        self.options_layout.addLayout(h_layout)
+        
+        # 強制隱藏並勾選 WSL (因為 OpenSSL 通常依賴 Linux 環境)
+        self.use_wsl_ck.setChecked(True)
+        self.use_wsl_ck.setVisible(False)
+
+    def on_start_clicked(self):
+        raw_target = self.target_edit.text().strip()
+        port = self.port_edit.text().strip() or "443"
+        if not raw_target:
+            self.output.appendPlainText("[ERROR] 請輸入 Target")
+            return
+            
+        target = raw_target.replace("https://", "").replace("http://", "").split("/")[0].split(":")[0]
+        
+        cmd_str = (f"echo | openssl s_client -showcerts -servername {target} -connect {target}:{port} 2>/dev/null "
+                   f"| openssl x509 -inform pem -noout -text")
+        
+        final_cmd = ["wsl", "bash", "-c", cmd_str]
+        
+        self.start_worker(final_cmd, raw_mode=True)
 
 class LsPage(ToolPageBase):
     def __init__(self, parent=None):
@@ -807,7 +1061,7 @@ class CatPage(ToolPageBase):
 class PingPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("測試連線品質、延遲 (Count 可設定)。支援範圍 Ping 與 Port 模式。")
+        self.desc.setText("測試連線品質、延遲 (Count 可設定)。支援範圍 Ping 與 指定單一Port口 模式。")
         form = QtWidgets.QFormLayout()
         self.cnt = QtWidgets.QLineEdit("4")
         form.addRow("Count:", self.cnt)
@@ -1014,7 +1268,7 @@ class PingPage(ToolPageBase):
 class NcPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("連線傳輸測試。若勾選 WSL，執行 WSL 的 nc。")
+        self.desc.setText("連線傳輸測試、監聽連線。")
         self.target_label.hide()
         self.target_edit.hide()
         
@@ -1050,7 +1304,7 @@ class NcPage(ToolPageBase):
 class NmapPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("掃描主機/埠。WSL + sudo 支援（會使用 echo PW | sudo -S 執行，注意風險）。")
+        self.desc.setText("掃描主機/埠，注意使用 sudo 風險。")
         f = QtWidgets.QFormLayout()
         
         self.scan = QtWidgets.QComboBox()
@@ -1115,12 +1369,16 @@ class NmapPage(ToolPageBase):
 class TraceroutePage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("路由追蹤。請在 Options 欄直接輸入完整 traceroute 參數（例如 -4 -d -w 300 -m 30）。")
+        self.desc.setText("路由追蹤，Options 可輸入額外參數。")
         form = QtWidgets.QFormLayout()
         self.opts_input = QtWidgets.QLineEdit()
-        self.opts_input.setPlaceholderText("輸入 traceroute 參數，例如: -4 -d -w 300 -m 30")
+        self.opts_input.setPlaceholderText("輸入 traceroute 參數，例如: -d -w 300")
         form.addRow("Options:", self.opts_input)
         self.options_layout.addLayout(form)
+        
+        # [MODIFIED] 移除 WSL checkbox 並隱藏
+        self.use_wsl_ck.setChecked(False)
+        self.use_wsl_ck.setVisible(False)
         
     def on_start_clicked(self):
         tgt = self.target_edit.text().strip()
@@ -1128,13 +1386,11 @@ class TraceroutePage(ToolPageBase):
             self.output.appendPlainText("[ERROR] 請輸入 target")
             return
             
-        use_wsl = self.use_wsl_ck.isChecked()
+        # 強制使用 Windows command
         opts = shlex.split(self.opts_input.text().strip()) if self.opts_input.text().strip() else []
+        cmd = ["tracert"] + opts + [tgt]
         
-        if is_windows() and not use_wsl:
-            cmd = ["tracert"] + opts + [tgt]
-        else:
-            cmd = ["wsl", "traceroute"] + opts + [tgt]
+        # 這裡需要傳遞 use_wsl=False 給 worker
         self.start_worker(cmd)
 
 class DigPage(ToolPageBase):
@@ -1170,6 +1426,8 @@ class CurlPage(ToolPageBase):
             self.output.appendPlainText("[ERROR] 請輸入 URL")
             return
         m = self.method.currentText()
+        cmd = ["curl", "-sS"]
+        
         if m == "HEAD":
             self.start_worker(["curl", "-I", url])
         elif m == "POST":
@@ -1180,7 +1438,7 @@ class CurlPage(ToolPageBase):
 class HydraPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("暴力破解（請在授權範圍內使用）。User/Pass 可選 Single 或 File（editable）。")
+        self.desc.setText("字典破解（請在授權範圍內使用）。User/Pass 可選單個或是多個待測參數。")
         form = QtWidgets.QFormLayout()
         
         self.service = QtWidgets.QComboBox()
@@ -1436,14 +1694,10 @@ class SshPage(ToolPageBase):
         k_lay.addWidget(QtWidgets.QLabel("Key Password:"), 1, 0)
         k_lay.addWidget(self.passphrase_edit, 1, 1, 1, 2)
         form.addRow(self.key_widget)
-
         self.port_edit = QtWidgets.QLineEdit("22")
         self.port_edit.setFixedWidth(80)
         form.addRow("Port:", self.port_edit)
-
         self.options_layout.addLayout(form)
-
-        # [修正] 移除這裡的 setStyleSheet，改用全域設定，解決縮放問題
         self.output.setReadOnly(True)
 
         # Command Input
@@ -1493,14 +1747,14 @@ class SshPage(ToolPageBase):
             if key == QtCore.Qt.Key_Down:
                 self._history_next()
                 return True
-                
+
         return super().eventFilter(obj, event)
 
     def _send_command(self):
         if not self._connected or not self._proc:
             return
-        line = self.input.text() 
-        
+        line = self.input.text()      
+
         if not self._history or (self._history and self._history[-1] != line):
             self._history.append(line)
         self._history_index = len(self._history)
@@ -1534,13 +1788,12 @@ class SshPage(ToolPageBase):
         def reader():
             while self._connected and self._proc:
                 try:
-                    # 使用 read(4096) 避免 peek 錯誤並提高效能
                     data = self._proc.stdout.read(4096)
                     if not data:
-                        break
-                    
-                    text = data.decode("utf-8", errors="replace")
-                    
+                        break            
+
+                    text = data.decode("utf-8", errors="replace")     
+
                     QtCore.QMetaObject.invokeMethod(
                         self, 
                         "_append_html_safe", 
@@ -1557,7 +1810,6 @@ class SshPage(ToolPageBase):
                 QtCore.Qt.QueuedConnection,
                 QtCore.Q_ARG(str, "\n[!] 連線已中斷")
             )
-
         threading.Thread(target=reader, daemon=True).start()
 
     @QtCore.pyqtSlot(str)
@@ -1567,16 +1819,16 @@ class SshPage(ToolPageBase):
 
         # 1. 統一將 \r\n 轉為 \n
         raw_text = raw_text.replace('\r\n', '\n')
-
-        # 2. [關鍵邏輯] 使用正則表達式分割 \n 與 \r
+        # [修正] 為了解決 cat 顯示問題，不再對 \r 進行刪除整行的操作
+        # 只保留 \n 換行，忽略單獨的 \r (或者視為無操作)
         parts = re.split(r'(\n|\r)', raw_text)
 
         for part in parts:
             if part == '\n':
                 cursor.insertBlock()
             elif part == '\r':
-                cursor.movePosition(QtGui.QTextCursor.StartOfBlock, QtGui.QTextCursor.KeepAnchor)
-                cursor.removeSelectedText()
+                # 忽略 \r，防止覆蓋上一行文字 (這是 cat 顯示不出來的主因)
+                pass
             else:
                 if part:
                     html_content = self.ansi_converter.convert(part)
@@ -1589,11 +1841,10 @@ class SshPage(ToolPageBase):
         host = self.target_edit.text().strip()
         user = self.user_edit.text().strip() or "root"
         port = self.port_edit.text().strip() or "22"
-
         self.output.clear()
         self.output.appendPlainText(f"[*] 正在連線 {user}@{host}:{port} ...")
-
         use_wsl = self.use_wsl_ck.isChecked()
+
         cmd = ["ssh", "-tt", "-p", port, "-o", "StrictHostKeyChecking=no", f"{user}@{host}"]
 
         if self.key_rb.isChecked():
@@ -1606,6 +1857,7 @@ class SshPage(ToolPageBase):
             if not pw:
                 self.output.appendPlainText("[ERROR] 密碼不能為空！")
                 return
+
             cmd = [
                 "env", f"SSHPASS={pw}",
                 "sshpass", "-e",
@@ -1681,7 +1933,7 @@ class GobusterAnsiConverter:
 class GobusterPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("列出目標網頁資料夾、文件 (CMD 模擬模式)")
+        self.desc.setText("列出目標網頁資料夾、文件")
         
         self.ansi_converter = GobusterAnsiConverter()
         
@@ -1690,7 +1942,7 @@ class GobusterPage(ToolPageBase):
         # -w Wordlist
         word_h = QtWidgets.QHBoxLayout()
         self.wordlist_edit = QtWidgets.QLineEdit()
-        self.wordlist_edit.setPlaceholderText("例如: /usr/share/wordlists/dirb/common.txt")
+        self.wordlist_edit.setPlaceholderText("/usr/share/wordlists/dirb/common.txt")
         self.wordlist_btn = QtWidgets.QPushButton("Browse")
         word_h.addWidget(self.wordlist_edit)
         word_h.addWidget(self.wordlist_btn)
@@ -1703,13 +1955,13 @@ class GobusterPage(ToolPageBase):
 
         # -x Extensions
         self.ext_edit = QtWidgets.QLineEdit()
-        self.ext_edit.setPlaceholderText("例如: php,html,txt")
+        self.ext_edit.setPlaceholderText("php,html,txt")
         form.addRow("-x Extensions:", self.ext_edit)
 
         # -o Output
         out_h = QtWidgets.QHBoxLayout()
         self.output_edit = QtWidgets.QLineEdit()
-        self.output_edit.setPlaceholderText("儲存結果檔案 (可選)")
+        self.output_edit.setPlaceholderText("儲存結果檔案")
         self.output_btn = QtWidgets.QPushButton("Browse")
         out_h.addWidget(self.output_edit)
         out_h.addWidget(self.output_btn)
@@ -1717,17 +1969,16 @@ class GobusterPage(ToolPageBase):
 
         # -s Status
         self.status_edit = QtWidgets.QLineEdit()
-        self.status_edit.setPlaceholderText("預設: 200,204,301,302,307,403,500")
+        self.status_edit.setPlaceholderText("200,204,301,302,307,403,500")
         form.addRow("-s Status:", self.status_edit)
 
         # Options
         self.options_edit = QtWidgets.QLineEdit()
-        self.options_edit.setPlaceholderText("其他參數, e.g. -k --timeout 10s")
+        self.options_edit.setPlaceholderText("-k --timeout 10s")
         form.addRow("Options:", self.options_edit)
 
         self.options_layout.addLayout(form)
 
-        # [修正] 移除 setStyleSheet，使用全域黑框設定，修復縮放
         self.wordlist_btn.clicked.connect(self._browse_wordlist)
         self.output_btn.clicked.connect(self._browse_output)
 
@@ -1766,16 +2017,13 @@ class GobusterPage(ToolPageBase):
         cursor = self.output.textCursor()
         cursor.movePosition(QtGui.QTextCursor.End)
         
-        # [修改] 確保之前有空一行
         if self.output.document().characterCount() > 0:
-            cursor.insertBlock() # 換行
-            cursor.insertBlock() # 再換一行 (製造空行效果)
+            cursor.insertBlock() 
+            cursor.insertBlock() 
             
-        # [修改] [Finished] 改為純白色
         cursor.insertHtml('<span style="color:#FFFFFF; font-weight:bold">[Finished]</span>')
         self.output.ensureCursorVisible()
 
-        # 恢復按鈕狀態
         self.progress.setVisible(False)
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -1789,16 +2037,13 @@ class GobusterPage(ToolPageBase):
     def on_output_line(self, raw_line):
         import re
 
-        # 1. 前置清理
         if not raw_line: return
         clean_line = raw_line.replace('\x1b[2K', '')
         if not clean_line.strip(): return
 
-        # 2. 準備游標
         cursor = self.output.textCursor()
         cursor.movePosition(QtGui.QTextCursor.End)
         
-        # 3. 【防誤刪機制】
         cursor.select(QtGui.QTextCursor.BlockUnderCursor)
         last_line_text = cursor.selectedText()
         
@@ -1807,19 +2052,14 @@ class GobusterPage(ToolPageBase):
         else:
             cursor.clearSelection() 
         
-        # 4. 【資訊分離】
         results = re.findall(r"(\/[^\s]+\s+\(Status:\s+\d+\))", clean_line)
         progress_matches = re.findall(r"(Progress:.*?\))", clean_line)
         latest_progress = progress_matches[-1] if progress_matches else None
         
-        # 5. 【寫入順序】
-        
-        # --- A. 寫入結果 ---
         for res in results:
             if cursor.positionInBlock() > 0:
                 cursor.insertBlock()
             
-            # 上色保持原樣 (狀態碼顏色)
             if "200" in res: html = f'<span style="color:#2ea84a">{res}</span>'
             elif "301" in res: html = f'<span style="color:#f0ad4e">{res}</span>'
             elif "403" in res: html = f'<span style="color:#d9534f">{res}</span>'
@@ -1828,12 +2068,10 @@ class GobusterPage(ToolPageBase):
             cursor.insertHtml(html)
             cursor.insertBlock() 
 
-        # --- B. 寫入進度 ---
         if latest_progress:
             if cursor.positionInBlock() > 0:
                 cursor.insertBlock()
                 
-            # [修改] Progress 改為純白色
             cursor.insertHtml(f'<span style="color:#FFFFFF">{latest_progress}</span>')
 
         self.output.ensureCursorVisible()
@@ -1842,21 +2080,16 @@ class GobusterPage(ToolPageBase):
         mw = self.main_window()
         if not mw: return
 
-        # 強制使用 UTF-8 編碼 (因為我們會強制走 WSL)
         mw.set_encoding_based_on_wsl(True)
         encoding = "utf-8"
 
         self.output.clear()
         
-        # [修改] [START] 改為純白色
-        # 我們不印出指令，只印出標籤
         self.output.appendHtml('<span style="color:#FFFFFF; font-weight:bold">[START]</span><br>')
 
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         
-        # [關鍵修改] 這裡強制傳入 use_wsl=True !!!
-        # 這樣 CmdWorker 就不會去加 powershell 的前綴，解決指令被汙染的問題
         self.worker = CmdWorker(cmd_list, encoding=encoding, use_wsl=True)
         
         self.thread = QtCore.QThread()
@@ -1886,7 +2119,6 @@ class GobusterPage(ToolPageBase):
         if output_path:
             output_path = self._convert_path_for_wsl(output_path)
 
-        # 這裡我們手動組裝 wsl 指令
         cmd = ["wsl", "gobuster"] 
         
         cmd.extend(["-u", self._quote_if_needed(target)])
@@ -1912,6 +2144,84 @@ class GobusterPage(ToolPageBase):
         
         self.start_worker(cmd)
 
+# [NEW] REPORT PAGE
+class ReportPage(ToolPageBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.desc.setText("自動化蒐集目標資訊並生成 HTML 報告。包含 Ping, Traceroute, WhatWeb, Dig, Nmap, Curl, SSL, Gobuster。")
+        self.target_edit.setPlaceholderText("Target Domain / IP (e.g. google.com)")
+        self.start_btn.setText("Generate Full Report")
+        
+        # [MODIFIED] 報告頁面強制 WSL 並隱藏
+        self.use_wsl_ck.setChecked(True)
+        self.use_wsl_ck.setVisible(False)
+        
+        self.ansi = AnsiConverter()
+
+    def on_start_clicked(self):
+        target = self.target_edit.text().strip()
+        if not target:
+            self.output.appendPlainText("[ERROR] Please enter a target")
+            return
+
+        self.output.clear()
+        
+        mw = self.main_window()
+        
+        if mw: mw.set_encoding_based_on_wsl(True)
+        encoding = "utf-8"
+        
+        self.worker = ReportWorker(target, encoding)
+        self.thread = QtCore.QThread()
+        self.worker.moveToThread(self.thread)
+        
+        self.worker.log_message.connect(self.output.appendPlainText)
+        
+        self.worker.stream_output.connect(self._handle_stream)
+        
+        self.worker.finished.connect(self._on_report_finished)
+        
+        self.thread.started.connect(self.worker.run)
+        self.thread.start()
+        
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    @QtCore.pyqtSlot(str)
+    def _handle_stream(self, text):
+        parts = re.split(r'(\n|\r)', text)
+        cursor = self.output.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.End)
+        
+        for p in parts:
+            if p == '\n':
+                cursor.insertBlock()
+            elif p == '\r': 
+                cursor.movePosition(QtGui.QTextCursor.StartOfBlock, QtGui.QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            elif p:
+                cursor.insertHtml(self.ansi.convert(p))
+        
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
+
+    def _on_report_finished(self, filename):
+        if filename:
+            self.output.appendHtml(f"<br><span style='color:#28CD41; font-weight:bold'>[FINISHED] Report generated: {filename}</span>")
+        else:
+            self.output.appendPlainText("\n[FAILED] Report generation failed.")
+        
+        self.progress.setVisible(False)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        if self.thread:
+            self.thread.quit()
+            self.thread.wait()
+            self.thread = None
+            self.worker = None
+
 # ==========================================
 #              MAIN WINDOW
 # ==========================================
@@ -1935,25 +2245,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.setMouseTracking(True)
         self.nav.setFont(QtGui.QFont("Segoe UI", 10))
         
-        # [修改] 1. 更新第一項工具名稱
-        tools = [
-            "顯示目標裝置資訊", "檔案列表", "查看文件內容", "IP狀態查詢", "傳輸測試",
+        # Status Bar
+        self.status = QtWidgets.QStatusBar()
+        self.setStatusBar(self.status)
+        
+        self.encoding_label = QtWidgets.QLabel("編碼:")
+        self.encoding_combo = QtWidgets.QComboBox()
+        encs = ["utf-8", "cp950", "big5", "gbk", "shift_jis", "iso-8859-1", "windows-1252", "euc-kr", "utf-16"]
+        self.encoding_combo.addItems(encs)
+        self.encoding_combo.setCurrentText("cp950")
+        self.encoding_combo.setFixedWidth(140)
+        
+        self.wsl_status_label = QtWidgets.QLabel()
+        self.wsl_status_label.setFixedWidth(160)
+        
+        self.status.addPermanentWidget(self.encoding_label)
+        self.status.addPermanentWidget(self.encoding_combo)
+        self.status.addPermanentWidget(self.wsl_status_label)
+
+        # [MODIFIED] 工具列表 - 移除了 "Automation" 文字，只保留分隔線
+        
+        standard_tools = [
+            "顯示目標裝置資訊", "SSL/TLS 憑證檢查",
+            "檔案列表", "查看文件內容", "IP狀態查詢", "傳輸測試",
             "埠口掃描", "路由追蹤", "DNS查詢", "網頁原始碼擷取", "弱密碼測試", "SSH連線", "列出網頁文件"
         ]
         
-        for t in tools:
+        for t in standard_tools:
             it = QtWidgets.QListWidgetItem(t)
             it.setTextAlignment(QtCore.Qt.AlignVCenter)
             self.nav.addItem(it)
+            
+        # [MODIFIED] 純分隔線
+        sep = QtWidgets.QListWidgetItem("────────────────")
+        sep.setFlags(QtCore.Qt.NoItemFlags) 
+        sep.setTextAlignment(QtCore.Qt.AlignCenter)
+        sep.setForeground(QtGui.QBrush(QtGui.QColor("#888888")))
+        self.nav.addItem(sep)
+        
+        # [MODIFIED] 移除了 (Report) 字樣
+        rep_item = QtWidgets.QListWidgetItem("一鍵生成報告")
+        rep_item.setTextAlignment(QtCore.Qt.AlignVCenter)
+        rep_item.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Bold))
+        rep_item.setForeground(QtGui.QBrush(QtGui.QColor("#007AFF")))
+        self.nav.addItem(rep_item)
+
         main_layout.addWidget(self.nav)
 
-        # Page Stack
         self.stack = QtWidgets.QStackedWidget()
         main_layout.addWidget(self.stack, 1)
         
-        # [修改] 2. 將第一項對應到 WhatWebPage
+        # [MODIFIED] 頁面對映更新
         clsmap = {
+            "一鍵生成報告": ReportPage, 
             "顯示目標裝置資訊": WhatWebPage,
+            "SSL/TLS 憑證檢查": SslCertPage, 
             "檔案列表": LsPage,
             "查看文件內容": CatPage,
             "IP狀態查詢": PingPage,
@@ -1968,34 +2314,23 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         
         self.pages = {}
-        for name in tools:
+        
+        for name in standard_tools:
             p = clsmap[name](self)
             self.pages[name] = p
             self.stack.addWidget(p)
             
-        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.nav.setCurrentRow(0)
-
-        # Status Bar
-        self.status = QtWidgets.QStatusBar()
-        self.setStatusBar(self.status)
+        self.stack.addWidget(QtWidgets.QWidget()) 
         
-        self.encoding_label = QtWidgets.QLabel("編碼:")
-        self.encoding_combo = QtWidgets.QComboBox()
-        encs = ["utf-8", "cp950", "big5", "gbk", "shift_jis", "iso-8859-1", "windows-1252", "euc-kr", "utf-16"]
-        self.encoding_combo.addItems(encs)
-        self.encoding_combo.setCurrentText("cp950")
-        self.encoding_combo.setFixedWidth(140)
+        report_p = clsmap["一鍵生成報告"](self)
+        self.pages["一鍵生成報告"] = report_p
+        self.stack.addWidget(report_p)
+            
+        self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentRowChanged.connect(self._sync_encoding_on_page_change)
+        self.nav.setCurrentRow(0)
         
         self.set_encoding_based_on_wsl(False, initial=True)
-        
-        self.status.addPermanentWidget(self.encoding_label)
-        self.status.addPermanentWidget(self.encoding_combo)
-        
-        self.wsl_status_label = QtWidgets.QLabel()
-        self.wsl_status_label.setFixedWidth(160)
-        self.status.addPermanentWidget(self.wsl_status_label)
-        
         self._update_wsl_status(initial=True)
         
         self.wsl_timer = QtCore.QTimer(self)
@@ -2003,57 +2338,45 @@ class MainWindow(QtWidgets.QMainWindow):
         self.wsl_timer.timeout.connect(self._update_wsl_status)
         self.wsl_timer.start()
         
-        # ==========================================
-        # [NEW] Menu & Font Control
-        # ==========================================
         menubar = self.menuBar()
         
-        # Env Menu
         env_menu = menubar.addMenu("環境 (Env)")
         ac = QtWidgets.QAction("立即檢查 WSL", self)
         ac.triggered.connect(lambda: self._update_wsl_status(force=True))
         env_menu.addAction(ac)
 
-        # View Menu (字體控制)
         view_menu = menubar.addMenu("檢視 (View)")
         
         font_act = QtWidgets.QAction("設定字型與大小 (Font Settings)", self)
-        font_act.setShortcut("Ctrl+F") # 快捷鍵 Ctrl+F
+        font_act.setShortcut("Ctrl+F") 
         font_act.triggered.connect(self.open_font_dialog)
         view_menu.addAction(font_act)
         
         view_menu.addSeparator()
 
         zoom_in_act = QtWidgets.QAction("放大 (Zoom In)", self)
-        zoom_in_act.setShortcut("Ctrl+=") # 快捷鍵 Ctrl + =
+        zoom_in_act.setShortcut("Ctrl+=") 
         zoom_in_act.triggered.connect(lambda: self.change_zoom(1))
         view_menu.addAction(zoom_in_act)
 
         zoom_out_act = QtWidgets.QAction("縮小 (Zoom Out)", self)
-        zoom_out_act.setShortcut("Ctrl+-") # 快捷鍵 Ctrl + -
+        zoom_out_act.setShortcut("Ctrl+-") 
         zoom_out_act.triggered.connect(lambda: self.change_zoom(-1))
         view_menu.addAction(zoom_out_act)
 
-        # Events
         self.encoding_combo.currentTextChanged.connect(lambda t: self.status.showMessage(f"編碼: {t}", 1500))
         self.nav.currentRowChanged.connect(self._sync_encoding_on_page_change)
 
-    # ==========================================
-    # [NEW] Font Logic
-    # ==========================================
     def open_font_dialog(self):
-        # 取得當前第一頁的字體作為預設值
         current_font = list(self.pages.values())[0].output.font()
         font, ok = QtWidgets.QFontDialog.getFont(current_font, self, "選擇輸出區字體")
         if ok:
-            # 將字體套用到所有頁面的 output 區塊
             for page in self.pages.values():
                 if hasattr(page, 'output'):
                     page.output.setFont(font)
             self.status.showMessage(f"字體已更新: {font.family()} {font.pointSize()}pt", 3000)
 
     def change_zoom(self, delta):
-        # delta 為正數放大，負數縮小
         for page in self.pages.values():
             if hasattr(page, 'output'):
                 if delta > 0:
