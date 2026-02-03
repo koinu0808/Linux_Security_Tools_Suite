@@ -171,7 +171,8 @@ def wsl_available(force=False):
     cmds = [["wsl", "wslpath", "/"], ["wsl", "-l"], ["wsl", "echo", "ok"]]
     for c in cmds:
         try:
-            p = subprocess.run(c, capture_output=True, text=True, timeout=1.0)
+            # [修正] 加入 encoding="utf-8" 和 errors="replace"
+            p = subprocess.run(c, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1.0)
             if p.returncode == 0:
                 val = True
                 break
@@ -513,7 +514,7 @@ class ReportWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self):
-        self.stream_output.emit("[START]\n")
+        self.stream_output.emit("[START]\n\n")
         
         clean_domain = self.target.replace("http://", "").replace("https://", "").split("/")[0].split(":")[0]
         if self.target.lower().startswith("http"):
@@ -629,7 +630,7 @@ class ToolPageBase(QtWidgets.QWidget):
         top_layout.addLayout(form_layout, 1)
 
         right_layout = QtWidgets.QVBoxLayout()
-        self.use_wsl_ck = QtWidgets.QCheckBox("使用 WSL 執行 (Windows)")
+        self.use_wsl_ck = QtWidgets.QCheckBox("使用 WSL 執行")
         
         # [修改] 預設勾選 WSL
         self.use_wsl_ck.setChecked(True)
@@ -977,6 +978,33 @@ class CatPage(ToolPageBase):
         if p:
             target_edit.setText(p)
 
+    def _convert_path_for_wsl(self, path):
+        """將 Windows 路徑轉換為 WSL 路徑 (/mnt/c/...)"""
+        if not is_windows():
+            return path
+        # 嘗試使用 wslpath 工具
+        try:
+            # [修正] 這裡必須指定用 utf-8 讀取 wsl 的輸出，否則遇到中文路徑會崩潰
+            result = subprocess.run(
+                ["wsl", "wslpath", "-a", path], 
+                capture_output=True, 
+                text=True, 
+                encoding="utf-8",     # 關鍵修正
+                errors="replace",     # 防止任何解碼錯誤導致崩潰
+                timeout=1
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except:
+            pass
+        
+        # 手動轉換 fallback
+        if len(path) >= 2 and path[1] == ":":
+            drive = path[0].lower()
+            tail = path[2:].replace("\\", "/")
+            return f"/mnt/{drive}{tail}"
+        return path
+
     def on_start_clicked(self):
         use_wsl = self.use_wsl_ck.isChecked()
         
@@ -989,7 +1017,9 @@ class CatPage(ToolPageBase):
             self.output.setPlainText("")
             
             if use_wsl:
-                self.start_worker(["wsl", "cat", f])
+                # [FIX] 這裡加入路徑轉換
+                wsl_path = self._convert_path_for_wsl(f)
+                self.start_worker(["wsl", "cat", wsl_path])
                 return
                 
             if os.path.exists(f):
@@ -1023,6 +1053,7 @@ class CatPage(ToolPageBase):
             self.output.appendPlainText(s)
             return
 
+        # 比對模式 (使用 Python 本地比對，不需要轉 WSL 路徑，因為是用 Python open() 讀取)
         f1 = self.file1_edit.text().strip()
         f2 = self.file2_edit.text().strip()
         if not f1 or not f2:
@@ -2144,6 +2175,74 @@ class GobusterPage(ToolPageBase):
         
         self.start_worker(cmd)
 
+class ExifToolPage(ToolPageBase):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.desc.setText("讀取圖片、PDF 或各類檔案的 Metadata 隱藏資訊。")
+        
+        self.target_label.hide()
+        self.target_edit.hide()
+        
+        h_layout = QtWidgets.QHBoxLayout()
+        self.file_edit = QtWidgets.QLineEdit()
+        self.file_edit.setPlaceholderText("選擇要分析的圖片或檔案...")
+        self.browse_btn = QtWidgets.QPushButton("Browse")
+        
+        h_layout.addWidget(QtWidgets.QLabel("File:"))
+        h_layout.addWidget(self.file_edit)
+        h_layout.addWidget(self.browse_btn)
+        
+        self.options_layout.addLayout(h_layout)
+        self.browse_btn.clicked.connect(self._browse_file)
+
+    def _browse_file(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "選擇檔案", "", "All Files (*)")
+        if path:
+            self.file_edit.setText(path)
+
+    def _convert_path_for_wsl(self, path):
+        """將 Windows 路徑轉換為 WSL 路徑 (/mnt/c/...)"""
+        if not is_windows():
+            return path
+        # 嘗試使用 wslpath 工具
+        try:
+            # [修正] 這裡必須指定用 utf-8 讀取 wsl 的輸出，否則遇到中文路徑會崩潰
+            result = subprocess.run(
+                ["wsl", "wslpath", "-a", path], 
+                capture_output=True, 
+                text=True, 
+                encoding="utf-8",     # 關鍵修正
+                errors="replace",     # 防止任何解碼錯誤導致崩潰
+                timeout=1
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except:
+            pass
+        
+        # 手動轉換 fallback
+        if len(path) >= 2 and path[1] == ":":
+            drive = path[0].lower()
+            tail = path[2:].replace("\\", "/")
+            return f"/mnt/{drive}{tail}"
+        return path
+
+    def on_start_clicked(self):
+        path = self.file_edit.text().strip()
+        if not path:
+            self.output.appendPlainText("[ERROR] 請先選擇檔案")
+            return
+
+        use_wsl = self.use_wsl_ck.isChecked()
+        
+        if use_wsl:
+            final_path = self._convert_path_for_wsl(path)
+            cmd = ["wsl", "exiftool", "-x", "ExifToolVersion", final_path]
+        else:
+            cmd = ["exiftool", "-x", "ExifToolVersion", path]
+            
+        self.start_worker(cmd)
+
 # [NEW] REPORT PAGE
 class ReportPage(ToolPageBase):
     def __init__(self, parent=None):
@@ -2238,14 +2337,12 @@ class MainWindow(QtWidgets.QMainWindow):
         main_layout = QtWidgets.QHBoxLayout(central)
         main_layout.setContentsMargins(0, 8, 8, 8)
 
-        # Navigation Bar
         self.nav = QtWidgets.QListWidget()
         self.nav.setFixedWidth(200)
         self.nav.setSpacing(0)
         self.nav.setMouseTracking(True)
         self.nav.setFont(QtGui.QFont("Segoe UI", 10))
         
-        # Status Bar
         self.status = QtWidgets.QStatusBar()
         self.setStatusBar(self.status)
         
@@ -2253,7 +2350,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.encoding_combo = QtWidgets.QComboBox()
         encs = ["utf-8", "cp950", "big5", "gbk", "shift_jis", "iso-8859-1", "windows-1252", "euc-kr", "utf-16"]
         self.encoding_combo.addItems(encs)
-        self.encoding_combo.setCurrentText("cp950")
+        
+        # [修改 1] 這裡預設設為 utf-8
+        self.encoding_combo.setCurrentText("utf-8")
         self.encoding_combo.setFixedWidth(140)
         
         self.wsl_status_label = QtWidgets.QLabel()
@@ -2263,12 +2362,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status.addPermanentWidget(self.encoding_combo)
         self.status.addPermanentWidget(self.wsl_status_label)
 
-        # [MODIFIED] 工具列表 - 移除了 "Automation" 文字，只保留分隔線
-        
         standard_tools = [
             "顯示目標裝置資訊", "SSL/TLS 憑證檢查",
             "檔案列表", "查看文件內容", "IP狀態查詢", "傳輸測試",
-            "埠口掃描", "路由追蹤", "DNS查詢", "網頁原始碼擷取", "弱密碼測試", "SSH連線", "列出網頁文件"
+            "埠口掃描", "路由追蹤", "DNS查詢", "網頁原始碼擷取", "弱密碼測試", "SSH連線", "列出網頁文件",
+            "掃描檔案/圖片隱藏資訊"
         ]
         
         for t in standard_tools:
@@ -2276,14 +2374,12 @@ class MainWindow(QtWidgets.QMainWindow):
             it.setTextAlignment(QtCore.Qt.AlignVCenter)
             self.nav.addItem(it)
             
-        # [MODIFIED] 純分隔線
         sep = QtWidgets.QListWidgetItem("────────────────")
         sep.setFlags(QtCore.Qt.NoItemFlags) 
         sep.setTextAlignment(QtCore.Qt.AlignCenter)
         sep.setForeground(QtGui.QBrush(QtGui.QColor("#888888")))
         self.nav.addItem(sep)
         
-        # [MODIFIED] 移除了 (Report) 字樣
         rep_item = QtWidgets.QListWidgetItem("一鍵生成報告")
         rep_item.setTextAlignment(QtCore.Qt.AlignVCenter)
         rep_item.setFont(QtGui.QFont("Segoe UI", 10, QtGui.QFont.Bold))
@@ -2295,7 +2391,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack = QtWidgets.QStackedWidget()
         main_layout.addWidget(self.stack, 1)
         
-        # [MODIFIED] 頁面對映更新
         clsmap = {
             "一鍵生成報告": ReportPage, 
             "顯示目標裝置資訊": WhatWebPage,
@@ -2310,7 +2405,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "網頁原始碼擷取": CurlPage,
             "弱密碼測試": HydraPage,
             "SSH連線": SshPage,
-            "列出網頁文件": GobusterPage
+            "列出網頁文件": GobusterPage,
+            "掃描檔案/圖片隱藏資訊": ExifToolPage
         }
         
         self.pages = {}
@@ -2330,7 +2426,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.nav.currentRowChanged.connect(self._sync_encoding_on_page_change)
         self.nav.setCurrentRow(0)
         
-        self.set_encoding_based_on_wsl(False, initial=True)
+        # [修改 2] 初始化時傳入 True (代表 WSL/UTF-8 模式)
+        self.set_encoding_based_on_wsl(True, initial=True)
         self._update_wsl_status(initial=True)
         
         self.wsl_timer = QtCore.QTimer(self)
