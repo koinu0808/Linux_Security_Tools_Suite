@@ -92,6 +92,12 @@
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\\Lib\\copy.py',
    'PYMODULE'),
+  ('core',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\core\\__init__.py',
+   'PYMODULE'),
+  ('core.env',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\core\\env.py',
+   'PYMODULE'),
   ('csv',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\\Lib\\csv.py',
@@ -580,6 +586,15 @@
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\\Lib\\tokenize.py',
    'PYMODULE'),
+  ('tools',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\tools\\__init__.py',
+   'PYMODULE'),
+  ('tools.hook',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\tools\\hook.py',
+   'PYMODULE'),
+  ('tools.original_pages',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\tools\\original_pages.py',
+   'PYMODULE'),
   ('tracemalloc',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\\Lib\\tracemalloc.py',
@@ -587,6 +602,12 @@
   ('typing',
    'C:\\Program '
    'Files\\WindowsApps\\PythonSoftwareFoundation.Python.3.12_3.12.2800.0_x64__qbz5n2kfra8p0\\Lib\\typing.py',
+   'PYMODULE'),
+  ('ui',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\ui\\__init__.py',
+   'PYMODULE'),
+  ('ui.main_window',
+   'C:\\Users\\zjapa\\OneDrive\\桌面\\專題\\Linux_Security_Tools_Suite\\ui\\main_window.py',
    'PYMODULE'),
   ('urllib',
    'C:\\Program '
