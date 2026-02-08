@@ -1,11 +1,6 @@
-password
-123456
-Test123!
-qazwsx
-letmein
 admin
-yhchen
 kali
+yhchen
 ubuntu
 koinu
 P@ssw0rd!
