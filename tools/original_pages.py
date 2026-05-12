@@ -1451,9 +1451,9 @@ class DigPage(ToolPageBase):
 class HeadersPage(ToolPageBase):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.desc.setText("快速查看 HTTP response headers (等同 curl -I)。")
+        self.desc.setText("快速查看 HTTP response headers。")
         f = QtWidgets.QFormLayout()
-        self.follow_ck = QtWidgets.QCheckBox("Follow redirect (-L)")
+        self.follow_ck = QtWidgets.QCheckBox("Follow redirect")
         f.addRow("", self.follow_ck)
         self.options_layout.addLayout(f)
 
