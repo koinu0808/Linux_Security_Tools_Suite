@@ -293,7 +293,17 @@ class ReportWorker(QtCore.QObject):
         self.encoding = encoding
         self._stop = False
         self.ansi_converter = AnsiConverter()
-        
+
+        # Dynamically resolve wordlist path relative to app root, then convert to WSL path
+        _app_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+        _wordlist_win = os.path.join(_app_dir, "files", "common.txt")
+        # Manual Windows->WSL path conversion (works with spaces, Chinese, any path)
+        _p = _wordlist_win.replace("\\", "/")
+        if len(_p) >= 2 and _p[1] == ":":
+            _wordlist_wsl = "/mnt/" + _p[0].lower() + "/" + _p[2:].lstrip("/")
+        else:
+            _wordlist_wsl = _p
+
         self.tasks = [
             ("Connectivity (Ping)", ["ping", "-c", "4", "{DOMAIN}"]),
             ("Route Analysis (Traceroute)", ["tracert", "{DOMAIN}"]),
@@ -302,7 +312,7 @@ class ReportWorker(QtCore.QObject):
             ("Port Scan (Nmap Fast)", ["nmap", "-F", "{DOMAIN}"]),
             ("HTTP Headers (Curl HEAD)", ["curl", "-I", "-s", "{URL}"]),
             ("SSL Certificate", ["bash", "-c", "echo | openssl s_client -showcerts -servername {DOMAIN} -connect {DOMAIN}:443 2>/dev/null | openssl x509 -inform pem -noout -text"]),
-            ("Directory Scan (Gobuster)", ["gobuster", "-u", "{URL}", "-w", "/usr/share/wordlists/dirb/common.txt", "-t", "20"])
+            ("Directory Scan (Gobuster)", ["gobuster", "-u", "{URL}", "-w", _wordlist_wsl, "-t", "20"])
         ]
 
     def _format_gobuster_html(self, raw_text):
@@ -317,6 +327,8 @@ class ReportWorker(QtCore.QObject):
         import re
 
         for line in lines:
+            # Strip all ANSI escape codes (not just \x1b[2K), matching GobusterPage behavior
+            line = re.sub(r'\x1b\[[0-9;?]*[a-zA-Z]', '', line)
             line = line.replace('\x1b[2K', '').strip()
             
             if not line: continue
@@ -324,19 +336,23 @@ class ReportWorker(QtCore.QObject):
             if line.startswith("=") or line.startswith("[+]"): continue
             if "Gobuster" in line or "Starting" in line or "Finished" in line: continue
 
-            match = re.search(r"(\S+)\s+\(Status:\s+(\d+)\)", line)
+            # Use same regex as GobusterPage.on_output_line: path must start with /
+            results = re.findall(r"(\/[^\s]+\s+\(Status:\s+\d+\))", line)
             
-            if match:
-                path = match.group(1)
-                code = match.group(2)
-                
-                color = COLOR_DEF
-                if code.startswith("2"): color = COLOR_2XX
-                elif code.startswith("3"): color = COLOR_3XX
-                elif code.startswith("4") or code.startswith("5"): color = COLOR_4XX
-                
-                row_html = f'<div><span style="color:{text_color}; font-weight:bold;">{path}</span> <span style="color:{color}">(Status: {code})</span></div>'
-                formatted_html += row_html
+            if results:
+                for res in results:
+                    match = re.search(r"(\/[^\s]+)\s+\(Status:\s+(\d+)\)", res)
+                    if match:
+                        path = match.group(1)
+                        code = match.group(2)
+                        
+                        color = COLOR_DEF
+                        if code.startswith("2"): color = COLOR_2XX
+                        elif code.startswith("3"): color = COLOR_3XX
+                        elif code.startswith("4") or code.startswith("5"): color = COLOR_4XX
+                        
+                        row_html = f'<div><span style="color:{text_color}; font-weight:bold;">{path}</span> <span style="color:{color}">(Status: {code})</span></div>'
+                        formatted_html += row_html
                 
         return formatted_html
 
