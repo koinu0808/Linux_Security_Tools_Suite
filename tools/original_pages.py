@@ -1310,6 +1310,17 @@ class NcPage(ToolPageBase):
         self.mode.currentIndexChanged.connect(self._update_mode_ui)
         self._update_mode_ui()
 
+        # 輸入框（仿 SSH，放在 output 下方）
+        self.input = QtWidgets.QLineEdit()
+        self.input.setPlaceholderText("輸入文字... 按 Enter 送出")
+        self.input.setEnabled(False)
+        self.layout().addWidget(self.input)
+        self.input.returnPressed.connect(self._send_input)
+
+        # 內部狀態
+        self._proc = None
+        self._connected = False
+
     def _update_mode_ui(self):
         is_listen = (self.mode.currentText() == "listen")
 
@@ -1320,6 +1331,63 @@ class NcPage(ToolPageBase):
 
         if is_listen:
             self.port.setFocus()
+
+    def _send_input(self):
+        if not self._connected or not self._proc:
+            return
+        line = self.input.text()
+        try:
+            self._proc.stdin.write((line + "\n").encode())
+            self._proc.stdin.flush()
+        except Exception:
+            self.output.appendPlainText("[ERROR] 無法送出資料（連線已中斷）")
+            self._connected = False
+            self.input.setEnabled(False)
+        self.input.clear()
+
+    def _start_reader(self):
+        def reader():
+            while self._connected and self._proc:
+                try:
+                    data = self._proc.stdout.read(4096)
+                    if not data:
+                        break
+                    text = data.decode("utf-8", errors="replace")
+                    QtCore.QMetaObject.invokeMethod(
+                        self.output,
+                        "appendPlainText",
+                        QtCore.Qt.QueuedConnection,
+                        QtCore.Q_ARG(str, text.rstrip("\n"))
+                    )
+                except Exception as e:
+                    print(f"NcPage reader error: {e}")
+                    break
+            self._connected = False
+            QtCore.QMetaObject.invokeMethod(
+                self.output,
+                "appendPlainText",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(str, "\n[!] 連線已中斷")
+            )
+            QtCore.QMetaObject.invokeMethod(
+                self.input,
+                "setEnabled",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(bool, False)
+            )
+            QtCore.QMetaObject.invokeMethod(
+                self.start_btn,
+                "setEnabled",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(bool, True)
+            )
+            QtCore.QMetaObject.invokeMethod(
+                self.stop_btn,
+                "setEnabled",
+                QtCore.Qt.QueuedConnection,
+                QtCore.Q_ARG(bool, False)
+            )
+        threading.Thread(target=reader, daemon=True).start()
 
     def on_start_clicked(self):
         mode = self.mode.currentText()
@@ -1335,15 +1403,53 @@ class NcPage(ToolPageBase):
 
         if use_wsl:
             if mode == "connect":
-                self.start_worker(["wsl", "nc", h, p], raw_mode=True)
+                cmd = ["wsl", "nc", h, p]
             else:
-                self.start_worker(["wsl", "nc", "-lnvp", p], raw_mode=True)
+                cmd = ["wsl", "nc", "-lvn", p]
         else:
             exe = "nc" if command_exists("nc") else ("ncat" if command_exists("ncat") else "nc")
             if mode == "connect":
-                self.start_worker([exe, h, p])
+                cmd = [exe, h, p]
             else:
-                self.start_worker([exe, "-lnvp", p])
+                cmd = [exe, "-lvn", p]
+
+        print(f"最終命令（NcPage）：{' '.join(cmd)}")
+        self.output.clear()
+        self.output.appendPlainText("[START]\n")
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=0,
+                universal_newlines=False
+            )
+            self._connected = True
+            self.input.setEnabled(True)
+            self.input.setFocus()
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 0)
+            self._start_reader()
+        except Exception as e:
+            self.output.appendPlainText(f"[ERROR] {e}")
+
+    def on_stop_clicked(self):
+        self._connected = False
+        self.input.setEnabled(False)
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
+        self.output.appendPlainText("[!] 已中止")
+        self.progress.setVisible(False)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
 class NmapPage(ToolPageBase):
     def __init__(self, parent=None):
